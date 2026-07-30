@@ -48,6 +48,11 @@ const docRef = doc(db, "app", "production-lines");
 
 /* ---------- Données ---------- */
 const DEFAULT_INDICATORS = ["État 5S", "Connexion ESD", "Affichage E/S", "Traçabilité", "Sécurité machine"];
+const SHIFTS = ["Shift 1", "Shift 2", "Shift 3"];
+
+function makeShiftIndicators(posteId, shift){
+  return DEFAULT_INDICATORS.map((name, idx) => ({ id:`${posteId}-${shift.replace(/\s+/g,"")}-I${idx}`, name, status:"OK" }));
+}
 
 function seedLines(){
   const defs = [
@@ -60,10 +65,26 @@ function seedLines(){
     id: line.id, name: line.name, subtitle: line.subtitle,
     postes: Array.from({length: line.postes}, (_, i) => {
       const posteId = `${line.id}-P${i+1}`;
-      return {
-        id: posteId, name: `Poste ${i+1}`,
-        indicators: DEFAULT_INDICATORS.map((name, idx) => ({ id:`${posteId}-I${idx}`, name, status:"OK" }))
-      };
+      const shifts = {};
+      SHIFTS.forEach(s => { shifts[s] = makeShiftIndicators(posteId, s); });
+      return { id: posteId, name: `Poste ${i+1}`, shifts };
+    })
+  }));
+}
+
+/* Convertit d'anciennes données (indicateurs uniques, sans shift) vers la structure par shift */
+function normalizeLines(lines){
+  return (lines || []).map(line => ({
+    ...line,
+    postes: (line.postes || []).map(poste => {
+      if (poste.shifts) return poste;
+      const shifts = {};
+      SHIFTS.forEach(s => {
+        shifts[s] = (poste.indicators || DEFAULT_INDICATORS.map(n=>({name:n,status:"OK"})))
+          .map((ind, idx) => ({ id: `${poste.id}-${s.replace(/\s+/g,"")}-I${idx}`, name: ind.name, status: ind.status || "OK" }));
+      });
+      const { indicators, ...rest } = poste;
+      return { ...rest, shifts };
     })
   }));
 }
@@ -71,6 +92,7 @@ function seedLines(){
 /* ---------- Accès superviseur / opérateur ---------- */
 const SUPERVISOR_PIN = "2909";
 const ROLE_KEY = "suivi-production-role";
+const SHIFT_KEY = "suivi-production-shift";
 
 /* ---------- État de l'application ---------- */
 let STATE = {
@@ -78,6 +100,7 @@ let STATE = {
   loading: true,
   connError: "",
   role: localStorage.getItem(ROLE_KEY) || null, // "superviseur" | "operateur" | null
+  shift: localStorage.getItem(SHIFT_KEY) || null, // "Shift 1" | "Shift 2" | "Shift 3" | null
   loginError: "",
   view: { screen: "home", lineId: null, posteId: null },
   modal: null,
@@ -86,7 +109,7 @@ let STATE = {
 /* Écoute en temps réel : toute modification faite sur un autre appareil arrive ici automatiquement */
 onSnapshot(docRef, (snap) => {
   if (snap.exists() && snap.data().json) {
-    try { STATE.lines = JSON.parse(snap.data().json); }
+    try { STATE.lines = normalizeLines(JSON.parse(snap.data().json)); }
     catch(e) { /* ignore malformed payload */ }
   } else {
     const seeded = seedLines();
@@ -126,9 +149,14 @@ function tryLoginSuperviseur(pin){
     setState({ loginError: "Code incorrect." });
   }
 }
+function chooseShift(shift){
+  localStorage.setItem(SHIFT_KEY, shift);
+  setState({ shift });
+}
 function logout(){
   localStorage.removeItem(ROLE_KEY);
-  setState({ role: null, view: {screen:"home", lineId:null, posteId:null} });
+  localStorage.removeItem(SHIFT_KEY);
+  setState({ role: null, shift: null, view: {screen:"home", lineId:null, posteId:null} });
 }
 
 /* Écrit dans Firestore ; tous les appareils connectés recevront la mise à jour automatiquement */
@@ -141,14 +169,19 @@ function persist(next){
 }
 
 /* ---------- Helpers métier ---------- */
-function nokCount(line){
-  return line.postes.reduce((acc,p)=> acc + p.indicators.filter(i=>i.status==="NOK").length, 0);
+function posteIndicators(poste){
+  // Tous les indicateurs de tous les shifts d'un poste, à plat
+  return SHIFTS.flatMap(s => (poste.shifts[s] || []).map(i => ({...i, shift:s})));
 }
-function posteHasNok(poste){ return poste.indicators.some(i=>i.status==="NOK"); }
+function nokCount(line){
+  return line.postes.reduce((acc,p)=> acc + posteIndicators(p).filter(i=>i.status==="NOK").length, 0);
+}
+function posteHasNok(poste){ return posteIndicators(poste).some(i=>i.status==="NOK"); }
+function shiftHasNok(poste, shift){ return (poste.shifts[shift]||[]).some(i=>i.status==="NOK"); }
 function getAllAnomalies(lines){
   const out = [];
-  lines.forEach(line => line.postes.forEach(poste => poste.indicators.forEach(ind => {
-    if (ind.status === "NOK") out.push({lineId:line.id, lineName:line.name, posteId:poste.id, posteName:poste.name, indicatorId:ind.id, indicatorName:ind.name});
+  lines.forEach(line => line.postes.forEach(poste => posteIndicators(poste).forEach(ind => {
+    if (ind.status === "NOK") out.push({lineId:line.id, lineName:line.name, posteId:poste.id, posteName:poste.name, indicatorId:ind.id, indicatorName:ind.name, shift:ind.shift});
   })));
   return out;
 }
@@ -157,14 +190,14 @@ function findPoste(lineId, posteId){ const l = findLine(lineId); return l ? l.po
 function esc(s){ return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
 /* ---------- Actions ---------- */
-function toggleIndicator(lineId, posteId, indicatorId){
-  // Le superviseur est en lecture seule sur les indicateurs OK/NOK
-  if (STATE.role !== "operateur") return;
+function toggleIndicator(lineId, posteId, shift, indicatorId){
+  // Le superviseur est en lecture seule ; un opérateur ne modifie que son propre shift
+  if (STATE.role !== "operateur" || shift !== STATE.shift) return;
   const next = STATE.lines.map(line => {
     if (line.id !== lineId) return line;
     return { ...line, postes: line.postes.map(p => {
       if (p.id !== posteId) return p;
-      return { ...p, indicators: p.indicators.map(i => i.id===indicatorId ? {...i, status: i.status==="OK"?"NOK":"OK"} : i) };
+      return { ...p, shifts: { ...p.shifts, [shift]: p.shifts[shift].map(i => i.id===indicatorId ? {...i, status: i.status==="OK"?"NOK":"OK"} : i) } };
     })};
   });
   persist(next);
@@ -191,7 +224,9 @@ function deleteLine(lineId){
 }
 function addPoste(lineId, name){
   const id = `${lineId}-P${Date.now()}`;
-  const newPoste = { id, name, indicators: DEFAULT_INDICATORS.map((n, idx) => ({ id:`${id}-I${idx}`, name:n, status:"OK" })) };
+  const shifts = {};
+  SHIFTS.forEach(s => { shifts[s] = makeShiftIndicators(id, s); });
+  const newPoste = { id, name, shifts };
   persist(STATE.lines.map(l => l.id===lineId ? {...l, postes:[...l.postes, newPoste]} : l));
   closeModal();
 }
@@ -218,9 +253,37 @@ function render(){
     wireEvents();
     return;
   }
+  if (STATE.role === "operateur" && !STATE.shift) {
+    app.innerHTML = shiftView();
+    if (window.lucide) lucide.createIcons();
+    wireEvents();
+    return;
+  }
   app.innerHTML = header() + connBanner() + body() + modalHtml();
   if (window.lucide) lucide.createIcons();
   wireEvents();
+}
+
+function shiftView(){
+  return `
+  <div class="min-h-screen flex items-center justify-center px-5">
+    <div class="w-full max-w-sm">
+      <div class="flex flex-col items-center mb-8">
+        <i data-lucide="clock" width="32" height="32" style="color:var(--accent);"></i>
+        <h1 class="text-xl font-semibold uppercase tracking-wide mt-3">Choisissez votre shift</h1>
+        <p class="text-sm mt-1" style="color:var(--muted);">Vos modifications seront liées à ce shift</p>
+      </div>
+      ${SHIFTS.map(s => `
+      <button data-action="choose-shift" data-shift="${esc(s)}" class="w-full rounded-lg border p-4 mb-3 flex items-center gap-3 hover:brightness-110 transition-all text-left"
+        style="background:var(--surface); border-color:var(--border);">
+        <i data-lucide="clock" width="18" height="18" style="color:var(--accent);"></i>
+        <span class="font-medium">${esc(s)}</span>
+      </button>`).join("")}
+      <button data-action="logout" class="w-full text-xs mt-2 hover:text-white transition-colors" style="color:var(--muted);">
+        ← Changer de profil
+      </button>
+    </div>
+  </div>`;
 }
 
 function loginView(){
@@ -285,7 +348,7 @@ function header(){
   const roleBadge = `
     <span class="text-xs px-2 py-1 rounded flex items-center gap-1" style="color:var(--muted); border:1px solid var(--border);">
       <i data-lucide="${STATE.role === "superviseur" ? "shield" : "user"}" width="12" height="12"></i>
-      ${STATE.role === "superviseur" ? "Superviseur" : "Opérateur"}
+      ${STATE.role === "superviseur" ? "Superviseur" : `Opérateur · ${esc(STATE.shift || "")}`}
     </span>
     <button data-action="logout" style="color:var(--muted);" class="hover:text-white transition-colors p-1" title="Changer de profil">
       <i data-lucide="log-out" width="16" height="16"></i>
@@ -372,7 +435,10 @@ function lineView(){
   if (!line) return `<main class="p-5">Ligne introuvable.</main>`;
   const tiles = line.postes.map(poste => {
     const alert = posteHasNok(poste);
-    const dots = poste.indicators.map(i => `<span title="${esc(i.name)}" class="w-2 h-2 rounded-full inline-block" style="background:${i.status==="OK"?"var(--ok)":"var(--nok)"}; box-shadow:0 0 6px ${i.status==="OK"?"var(--ok)":"var(--nok)"};"></span>`).join("");
+    const dots = SHIFTS.map(s => {
+      const bad = shiftHasNok(poste, s);
+      return `<span title="${esc(s)}" class="text-[9px] px-1.5 py-0.5 rounded font-medium mono" style="background:${bad?"rgba(229,72,77,0.15)":"rgba(74,222,128,0.15)"}; color:${bad?"var(--nok)":"var(--ok)"};">${s.replace("Shift ","S")}</span>`;
+    }).join("");
     return `
     <div class="rounded-lg border p-4" style="background:var(--surface); border-color:var(--border);">
       <div class="flex items-center justify-between mb-3">
@@ -409,14 +475,14 @@ function posteView(){
   const line = findLine(STATE.view.lineId);
   const poste = findPoste(STATE.view.lineId, STATE.view.posteId);
   if (!line || !poste) return `<main class="p-5">Poste introuvable.</main>`;
-  const readOnly = STATE.role !== "operateur";
-  const rows = poste.indicators.map(ind => {
+
+  const renderRow = (ind, shift, editable) => {
     const isOk = ind.status === "OK";
-    const tag = readOnly ? "div" : "button";
-    const actionAttr = readOnly ? "" : `data-action="toggle-indicator" data-line="${line.id}" data-poste="${poste.id}" data-ind="${ind.id}"`;
+    const tag = editable ? "button" : "div";
+    const actionAttr = editable ? `data-action="toggle-indicator" data-line="${line.id}" data-poste="${poste.id}" data-shift="${esc(shift)}" data-ind="${ind.id}"` : "";
     return `
     <${tag} ${actionAttr}
-      class="flex items-center justify-between rounded-lg border px-4 py-3.5 ${readOnly ? "" : "hover:brightness-110 cursor-pointer"} transition-all text-left w-full"
+      class="flex items-center justify-between rounded-lg border px-4 py-3.5 ${editable ? "hover:brightness-110 cursor-pointer" : ""} transition-all text-left w-full"
       style="background:var(--surface); border-color:${isOk?"var(--border)":"var(--nok)"};">
       <span class="text-sm font-medium">${esc(ind.name)}</span>
       <span class="flex items-center gap-2">
@@ -424,12 +490,30 @@ function posteView(){
         <span class="text-xs font-medium tracking-wider w-8 mono" style="color:${isOk?"var(--ok)":"var(--nok)"};">${ind.status}</span>
       </span>
     </${tag}>`;
-  }).join("");
+  };
+
+  if (STATE.role === "operateur") {
+    const rows = (poste.shifts[STATE.shift] || []).map(ind => renderRow(ind, STATE.shift, true)).join("");
+    return `
+    <main class="p-5 max-w-xl">
+      <p class="text-sm mb-4" style="color:var(--muted);">${esc(STATE.shift)} — cliquez sur un indicateur pour basculer son état.</p>
+      <div class="flex flex-col gap-2">${rows}</div>
+    </main>`;
+  }
+
+  // Superviseur : lecture seule, les 3 shifts affichés séparément
+  const sections = SHIFTS.map(s => `
+    <div class="mb-6">
+      <h2 class="text-sm font-semibold uppercase tracking-wide mb-2 flex items-center gap-2" style="color:var(--muted);">
+        <i data-lucide="clock" width="14" height="14"></i> ${esc(s)}
+      </h2>
+      <div class="flex flex-col gap-2">${(poste.shifts[s] || []).map(ind => renderRow(ind, s, false)).join("")}</div>
+    </div>`).join("");
 
   return `
   <main class="p-5 max-w-xl">
-    <p class="text-sm mb-4" style="color:var(--muted);">${readOnly ? "Lecture seule — seul l'opérateur peut modifier l'état des indicateurs." : "Cliquez sur un indicateur pour basculer son état. Les autres appareils voient le changement instantanément."}</p>
-    <div class="flex flex-col gap-2">${rows}</div>
+    <p class="text-sm mb-4" style="color:var(--muted);">Lecture seule — seul l'opérateur du shift concerné peut modifier ces indicateurs.</p>
+    ${sections}
   </main>`;
 }
 
@@ -438,7 +522,7 @@ function dashboardView(){
   const anomalies = getAllAnomalies(lines);
   const totalLines = lines.length;
   const totalPostes = lines.reduce((a,l)=>a+l.postes.length,0);
-  const totalIndicators = lines.reduce((a,l)=>a+l.postes.reduce((b,p)=>b+p.indicators.length,0),0);
+  const totalIndicators = lines.reduce((a,l)=>a+l.postes.reduce((b,p)=>b+posteIndicators(p).length,0),0);
   const totalNok = anomalies.length;
   const conformRate = totalIndicators>0 ? Math.round(((totalIndicators-totalNok)/totalIndicators)*100) : 100;
   const linesSorted = [...lines].sort((a,b)=>nokCount(b)-nokCount(a));
@@ -477,7 +561,7 @@ function dashboardView(){
         <span class="flex items-center gap-2">
           <span class="w-2.5 h-2.5 rounded-full flex-shrink-0" style="background:var(--nok); box-shadow:0 0 8px var(--nok);"></span>
           <span class="text-sm font-medium">${esc(a.indicatorName)}</span>
-          <span class="text-xs" style="color:var(--muted);">${esc(a.lineName)} · ${esc(a.posteName)}</span>
+          <span class="text-xs" style="color:var(--muted);">${esc(a.lineName)} · ${esc(a.posteName)} · ${esc(a.shift)}</span>
         </span>
         <i data-lucide="chevron-right" width="16" height="16" style="color:var(--muted);"></i>
       </button>`).join("");
@@ -552,6 +636,7 @@ function wireEvents(){
       const lineId = el.getAttribute("data-line");
       const posteId = el.getAttribute("data-poste");
       const indId = el.getAttribute("data-ind");
+      const shift = el.getAttribute("data-shift");
 
       switch(action){
         case "login-operateur": loginAsOperateur(); break;
@@ -560,6 +645,7 @@ function wireEvents(){
           tryLoginSuperviseur(pin);
           break;
         }
+        case "choose-shift": chooseShift(shift); break;
         case "logout": logout(); break;
         case "back":
           if (STATE.view.screen === "poste") navigate({screen:"line", lineId: STATE.view.lineId, posteId:null});
@@ -578,7 +664,7 @@ function wireEvents(){
         case "open-add-poste": openModal({type:"add-poste", lineId}); break;
         case "delete-poste": deletePoste(lineId, posteId); break;
         case "close-modal": closeModal(); break;
-        case "toggle-indicator": toggleIndicator(lineId, posteId, indId); break;
+        case "toggle-indicator": toggleIndicator(lineId, posteId, shift, indId); break;
         case "save-add-line": {
           const name = document.getElementById("modal-name").value.trim();
           const subtitle = document.getElementById("modal-subtitle").value.trim();
