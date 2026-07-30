@@ -68,11 +68,17 @@ function seedLines(){
   }));
 }
 
+/* ---------- Accès superviseur / opérateur ---------- */
+const SUPERVISOR_PIN = "2909";
+const ROLE_KEY = "suivi-production-role";
+
 /* ---------- État de l'application ---------- */
 let STATE = {
   lines: [],
   loading: true,
   connError: "",
+  role: localStorage.getItem(ROLE_KEY) || null, // "superviseur" | "operateur" | null
+  loginError: "",
   view: { screen: "home", lineId: null, posteId: null },
   modal: null,
 };
@@ -97,9 +103,33 @@ onSnapshot(docRef, (snap) => {
 });
 
 function setState(patch){ Object.assign(STATE, patch); render(); }
-function navigate(view){ setState({ view }); }
-function openModal(modal){ setState({ modal }); }
+function navigate(view){
+  // Un opérateur ne peut pas accéder au tableau de bord, même en forçant la navigation
+  if (view.screen === "dashboard" && STATE.role !== "superviseur") return;
+  setState({ view });
+}
+function openModal(modal){
+  // Ajout/modification de lignes et postes réservés au superviseur
+  if (["add-line","edit-line","edit-poste"].includes(modal.type) && STATE.role !== "superviseur") return;
+  setState({ modal });
+}
 function closeModal(){ setState({ modal: null }); }
+function loginAsOperateur(){
+  localStorage.setItem(ROLE_KEY, "operateur");
+  setState({ role: "operateur", loginError: "" });
+}
+function tryLoginSuperviseur(pin){
+  if (pin === SUPERVISOR_PIN) {
+    localStorage.setItem(ROLE_KEY, "superviseur");
+    setState({ role: "superviseur", loginError: "", modal: null });
+  } else {
+    setState({ loginError: "Code incorrect." });
+  }
+}
+function logout(){
+  localStorage.removeItem(ROLE_KEY);
+  setState({ role: null, view: {screen:"home", lineId:null, posteId:null} });
+}
 
 /* Écrit dans Firestore ; tous les appareils connectés recevront la mise à jour automatiquement */
 function persist(next){
@@ -160,9 +190,51 @@ function render(){
     if (window.lucide) lucide.createIcons();
     return;
   }
+  if (!STATE.role) {
+    app.innerHTML = loginView();
+    if (window.lucide) lucide.createIcons();
+    wireEvents();
+    return;
+  }
   app.innerHTML = header() + connBanner() + body() + modalHtml();
   if (window.lucide) lucide.createIcons();
   wireEvents();
+}
+
+function loginView(){
+  return `
+  <div class="min-h-screen flex items-center justify-center px-5">
+    <div class="w-full max-w-sm">
+      <div class="flex flex-col items-center mb-8">
+        <i data-lucide="factory" width="32" height="32" style="color:var(--accent);"></i>
+        <h1 class="text-xl font-semibold uppercase tracking-wide mt-3">Suivi de production</h1>
+        <p class="text-sm mt-1" style="color:var(--muted);">Choisissez votre profil</p>
+      </div>
+      <button data-action="login-operateur" class="w-full rounded-lg border p-4 mb-3 flex items-center gap-3 hover:brightness-110 transition-all text-left"
+        style="background:var(--surface); border-color:var(--border);">
+        <i data-lucide="user" width="20" height="20" style="color:var(--accent);"></i>
+        <span>
+          <span class="block font-medium">Opérateur</span>
+          <span class="block text-xs" style="color:var(--muted);">Accès direct, sans code</span>
+        </span>
+      </button>
+      <div class="rounded-lg border p-4" style="background:var(--surface); border-color:var(--border);">
+        <span class="flex items-center gap-3 mb-3">
+          <i data-lucide="shield" width="20" height="20" style="color:var(--accent);"></i>
+          <span>
+            <span class="block font-medium">Superviseur</span>
+            <span class="block text-xs" style="color:var(--muted);">Nécessite un code</span>
+          </span>
+        </span>
+        <input id="pin-input" type="password" inputmode="numeric" placeholder="Code" maxlength="8"
+          class="w-full rounded border px-3 py-2 text-sm mb-2 outline-none" style="background:var(--base); border-color:var(--border); color:var(--text);" />
+        ${STATE.loginError ? `<p class="text-xs mb-2" style="color:var(--nok);">${esc(STATE.loginError)}</p>` : ""}
+        <button data-action="login-superviseur" class="w-full text-sm rounded px-3 py-2 hover:brightness-110" style="background:var(--accent); color:#fff;">
+          Se connecter
+        </button>
+      </div>
+    </div>
+  </div>`;
 }
 
 function header(){
@@ -178,8 +250,7 @@ function header(){
       <i data-lucide="arrow-left" width="20" height="20"></i>
     </button>` : "";
 
-  const topActions = (v.screen === "home" || v.screen === "dashboard") ? `
-    <div class="ml-auto flex items-center gap-2">
+  const topActions = (v.screen === "home" || v.screen === "dashboard") && STATE.role === "superviseur" ? `
       <button data-action="goto-dashboard" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110 ${v.screen==="dashboard" ? "" : "border"}"
         style="${v.screen==="dashboard" ? "background:var(--accent);color:#fff;" : "border-color:var(--border);color:var(--text);"}">
         <i data-lucide="layout-dashboard" width="16" height="16"></i> Tableau de bord
@@ -187,8 +258,16 @@ function header(){
       ${v.screen === "home" ? `
       <button data-action="open-add-line" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110" style="background:var(--accent);color:#fff;">
         <i data-lucide="plus" width="16" height="16"></i> Nouvelle ligne
-      </button>` : ""}
-    </div>` : "";
+      </button>` : ""}` : "";
+
+  const roleBadge = `
+    <span class="text-xs px-2 py-1 rounded flex items-center gap-1" style="color:var(--muted); border:1px solid var(--border);">
+      <i data-lucide="${STATE.role === "superviseur" ? "shield" : "user"}" width="12" height="12"></i>
+      ${STATE.role === "superviseur" ? "Superviseur" : "Opérateur"}
+    </span>
+    <button data-action="logout" style="color:var(--muted);" class="hover:text-white transition-colors p-1" title="Changer de profil">
+      <i data-lucide="log-out" width="16" height="16"></i>
+    </button>`;
 
   const syncDot = STATE.connError
     ? `<span class="w-2 h-2 rounded-full" style="background:var(--nok);" title="Hors ligne"></span>`
@@ -202,7 +281,10 @@ function header(){
       <h1 class="text-lg font-semibold uppercase leading-none flex items-center gap-2">${esc(title)} ${syncDot}</h1>
       ${subtitle ? `<p class="text-xs mt-1" style="color:var(--muted);">${esc(subtitle)}</p>` : ""}
     </div>
-    ${topActions}
+    <div class="ml-auto flex items-center gap-2">
+      ${topActions}
+      ${roleBadge}
+    </div>
   </header>`;
 }
 
@@ -239,9 +321,10 @@ function homeView(){
             <p class="text-sm mt-0.5" style="color:var(--muted);">${esc(line.subtitle||"")}</p>
           </div>
           <div class="flex items-center gap-1 mt-1">
+            ${STATE.role === "superviseur" ? `
             <span data-action="open-edit-line" data-line="${line.id}" class="hover:text-white transition-colors p-1" style="color:var(--muted);" aria-label="Modifier la ligne">
               <i data-lucide="pencil" width="15" height="15"></i>
-            </span>
+            </span>` : ""}
             <i data-lucide="chevron-right" width="18" height="18" style="color:var(--muted);"></i>
           </div>
         </div>
@@ -270,9 +353,10 @@ function lineView(){
       <div class="flex items-center justify-between mb-3">
         <span class="flex items-center gap-1.5">
           <h3 class="font-semibold uppercase tracking-wide">${esc(poste.name)}</h3>
+          ${STATE.role === "superviseur" ? `
           <button data-action="open-edit-poste" data-line="${line.id}" data-poste="${poste.id}" class="hover:text-white transition-colors p-0.5" style="color:var(--muted);" aria-label="Modifier le poste">
             <i data-lucide="pencil" width="13" height="13"></i>
-          </button>
+          </button>` : ""}
         </span>
         <div class="flex gap-1">${dots}</div>
       </div>
@@ -430,6 +514,13 @@ function wireEvents(){
       const indId = el.getAttribute("data-ind");
 
       switch(action){
+        case "login-operateur": loginAsOperateur(); break;
+        case "login-superviseur": {
+          const pin = document.getElementById("pin-input").value.trim();
+          tryLoginSuperviseur(pin);
+          break;
+        }
+        case "logout": logout(); break;
         case "back":
           if (STATE.view.screen === "poste") navigate({screen:"line", lineId: STATE.view.lineId, posteId:null});
           else navigate({screen:"home", lineId:null, posteId:null});
