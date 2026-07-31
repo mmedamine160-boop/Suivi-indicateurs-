@@ -140,7 +140,7 @@ onSnapshot(docRef, (snap) => {
 function setState(patch){ Object.assign(STATE, patch); render(); }
 function navigate(view){
   // Un opérateur ne peut pas accéder au tableau de bord, même en forçant la navigation
-  if (view.screen === "dashboard" && STATE.role !== "superviseur") return;
+  if ((view.screen === "dashboard" || view.screen === "stats") && STATE.role !== "superviseur") return;
   setState({ view });
 }
 function openModal(modal){
@@ -385,6 +385,7 @@ function header(){
   let title = "Suivi de production";
   let subtitle = "";
   if (v.screen === "dashboard") title = "Tableau de bord";
+  if (v.screen === "stats") title = "Statistiques";
   if (v.screen === "line") { const l = findLine(v.lineId); title = l ? l.name : ""; subtitle = l ? l.subtitle : ""; }
   if (v.screen === "poste") { const l = findLine(v.lineId); const p = findPoste(v.lineId, v.posteId); title = p ? p.name : ""; subtitle = l ? `${l.name} · ${l.subtitle}` : ""; }
 
@@ -393,10 +394,14 @@ function header(){
       <i data-lucide="arrow-left" width="20" height="20"></i>
     </button>` : "";
 
-  const topActions = (v.screen === "home" || v.screen === "dashboard") && STATE.role === "superviseur" ? `
+  const topActions = (v.screen === "home" || v.screen === "dashboard" || v.screen === "stats") && STATE.role === "superviseur" ? `
       <button data-action="goto-dashboard" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110 ${v.screen==="dashboard" ? "" : "border"}"
         style="${v.screen==="dashboard" ? "background:var(--accent);color:#fff;" : "border-color:var(--border);color:var(--text);"}">
         <i data-lucide="layout-dashboard" width="16" height="16"></i> Tableau de bord
+      </button>
+      <button data-action="goto-stats" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110 ${v.screen==="stats" ? "" : "border"}"
+        style="${v.screen==="stats" ? "background:var(--accent);color:#fff;" : "border-color:var(--border);color:var(--text);"}">
+        <i data-lucide="bar-chart-3" width="16" height="16"></i> Statistiques
       </button>
       ${v.screen === "home" ? `
       <button data-action="open-add-line" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110" style="background:var(--accent);color:#fff;">
@@ -452,6 +457,7 @@ function body(){
   if (v.screen === "line") return lineView();
   if (v.screen === "poste") return posteView();
   if (v.screen === "dashboard") return dashboardView();
+  if (v.screen === "stats") return statsView();
   return "";
 }
 
@@ -649,7 +655,75 @@ function dashboardView(){
   </main>`;
 }
 
-/* ---------- Modales ---------- */
+/* ---------- Statistiques ---------- */
+function barChart(title, entries, colorVar){
+  // entries: [{label, count}], triés décroissant, affichés en barres horizontales
+  const max = Math.max(1, ...entries.map(e => e.count));
+  const rows = entries.map(e => `
+    <div class="mb-3">
+      <div class="flex items-center justify-between text-xs mb-1">
+        <span style="color:var(--text);">${esc(e.label)}</span>
+        <span class="mono" style="color:var(--muted);">${e.count}</span>
+      </div>
+      <div class="h-2.5 rounded-full overflow-hidden" style="background:var(--base);">
+        <div class="h-full rounded-full transition-all" style="width:${Math.round((e.count/max)*100)}%; background:var(${colorVar});"></div>
+      </div>
+    </div>`).join("");
+  return `
+  <div class="rounded-lg border p-4 mb-6" style="background:var(--surface); border-color:var(--border);">
+    <h2 class="text-sm font-semibold uppercase tracking-wide mb-4">${esc(title)}</h2>
+    ${entries.length === 0
+      ? `<p class="text-sm" style="color:var(--muted);">Aucune anomalie à afficher.</p>`
+      : rows}
+  </div>`;
+}
+
+function statsView(){
+  const anomalies = getAllAnomalies(STATE.lines);
+  const total = anomalies.length;
+
+  const count = (arr, keyFn) => {
+    const map = {};
+    arr.forEach(a => { const k = keyFn(a); map[k] = (map[k]||0) + 1; });
+    return Object.entries(map).map(([label,count])=>({label,count})).sort((a,b)=>b.count-a.count);
+  };
+
+  const byLine = count(anomalies, a => a.lineName);
+  const byShift = SHIFTS.map(s => ({ label: s, count: anomalies.filter(a=>a.shift===s).length }));
+  const byIndicator = count(anomalies, a => a.indicatorName);
+  const byPoste = count(anomalies, a => `${a.lineName} · ${a.posteName}`).slice(0,5);
+
+  const worstLine = byLine[0];
+  const worstIndicator = byIndicator[0];
+
+  const highlights = total === 0 ? `
+    <div class="rounded-lg border p-6 flex flex-col items-center text-center gap-2 mb-6" style="background:var(--surface); border-color:var(--border); color:var(--muted);">
+      <i data-lucide="check-circle-2" width="22" height="22" style="color:var(--ok);"></i>
+      <p class="text-sm">Aucune anomalie actuellement — rien à cibler.</p>
+    </div>` : `
+    <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-6">
+      <div class="rounded-lg border p-4" style="background:var(--surface); border-color:var(--nok);">
+        <p class="text-xs mb-1 flex items-center gap-1.5" style="color:var(--muted);"><i data-lucide="alert-triangle" width="12" height="12"></i> Ligne la plus touchée</p>
+        <p class="text-lg font-semibold">${esc(worstLine.label)}</p>
+        <p class="text-xs mono" style="color:var(--nok);">${worstLine.count} anomalie${worstLine.count>1?"s":""}</p>
+      </div>
+      <div class="rounded-lg border p-4" style="background:var(--surface); border-color:var(--nok);">
+        <p class="text-xs mb-1 flex items-center gap-1.5" style="color:var(--muted);"><i data-lucide="alert-triangle" width="12" height="12"></i> Indicateur le plus problématique</p>
+        <p class="text-lg font-semibold">${esc(worstIndicator.label)}</p>
+        <p class="text-xs mono" style="color:var(--nok);">${worstIndicator.count} occurrence${worstIndicator.count>1?"s":""}</p>
+      </div>
+    </div>`;
+
+  return `
+  <main class="p-5 max-w-4xl">
+    <p class="text-sm mb-4" style="color:var(--muted);">${total} anomalie${total>1?"s":""} au total, tous shifts confondus.</p>
+    ${highlights}
+    ${barChart("Anomalies par ligne", byLine, "--nok")}
+    ${barChart("Anomalies par shift", byShift, "--warn")}
+    ${barChart("Anomalies par type d'indicateur", byIndicator, "--nok")}
+    ${byPoste.length ? barChart("Top 5 des postes les plus critiques", byPoste, "--warn") : ""}
+  </main>`;
+}
 function modalHtml(){
   const m = STATE.modal;
   if (!m) return "";
@@ -755,6 +829,9 @@ function wireEvents(){
           break;
         case "goto-dashboard":
           navigate(STATE.view.screen==="dashboard" ? {screen:"home", lineId:null, posteId:null} : {screen:"dashboard", lineId:null, posteId:null});
+          break;
+        case "goto-stats":
+          navigate(STATE.view.screen==="stats" ? {screen:"home", lineId:null, posteId:null} : {screen:"stats", lineId:null, posteId:null});
           break;
         case "goto-line": navigate({screen:"line", lineId, posteId:null}); break;
         case "goto-poste": navigate({screen:"poste", lineId, posteId}); break;
