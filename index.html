@@ -108,14 +108,22 @@ const SHIFT_KEY = "suivi-production-shift";
 
 /* ---------- État de l'application ---------- */
 const HISTORY_LIMIT = 300;
+const ACCESS_LOG_LIMIT = 300;
+const ADMIN_EMAIL = "mmedamine160@gmail.com";
 let STATE = {
   lines: [],
   history: [], // journal des passages OK/NOK
+  accessLog: [], // journal des connexions superviseur (nom, e-mail, date)
   loading: true,
   connError: "",
   role: localStorage.getItem(ROLE_KEY) || null, // "superviseur" | "operateur" | null
   shift: localStorage.getItem(SHIFT_KEY) || null, // "Shift 1" | "Shift 2" | "Shift 3" | null
+  identified: false, // le superviseur doit s'identifier (nom + e-mail) à chaque connexion
+  supervisorName: "",
+  supervisorEmail: "",
+  isAdmin: false,
   loginError: "",
+  identifyError: "",
   view: { screen: "home", lineId: null, posteId: null },
   modal: null,
 };
@@ -129,16 +137,19 @@ onSnapshot(docRef, (snap) => {
         // Ancien format : le document ne contenait que le tableau des lignes
         STATE.lines = normalizeLines(raw);
         STATE.history = [];
+        STATE.accessLog = [];
       } else {
         STATE.lines = normalizeLines(raw.lines || []);
         STATE.history = raw.history || [];
+        STATE.accessLog = raw.accessLog || [];
       }
     } catch(e) { /* ignore malformed payload */ }
   } else {
     const seeded = seedLines();
     STATE.lines = seeded;
     STATE.history = [];
-    setDoc(docRef, { json: JSON.stringify({ lines: seeded, history: [] }), updatedAt: serverTimestamp() }).catch(()=>{});
+    STATE.accessLog = [];
+    setDoc(docRef, { json: JSON.stringify({ lines: seeded, history: [], accessLog: [] }), updatedAt: serverTimestamp() }).catch(()=>{});
   }
   STATE.loading = false;
   STATE.connError = "";
@@ -151,8 +162,9 @@ onSnapshot(docRef, (snap) => {
 
 function setState(patch){ Object.assign(STATE, patch); render(); }
 function navigate(view){
-  // Un opérateur ne peut pas accéder au tableau de bord, même en forçant la navigation
+  // Un opérateur ne peut pas accéder au tableau de bord ; le journal des connexions est réservé à l'admin
   if ((view.screen === "dashboard" || view.screen === "stats" || view.screen === "history") && STATE.role !== "superviseur") return;
+  if (view.screen === "access-log" && !STATE.isAdmin) return;
   setState({ view });
 }
 function openModal(modal){
@@ -178,16 +190,32 @@ function chooseShift(shift){
   localStorage.setItem(SHIFT_KEY, shift);
   setState({ shift });
 }
+function confirmIdentity(name, email){
+  const n = (name||"").trim(), e = (email||"").trim();
+  if (!n || !e || !e.includes("@")) {
+    setState({ identifyError: "Merci de renseigner un nom et un e-mail valide." });
+    return;
+  }
+  const isAdmin = e.toLowerCase() === ADMIN_EMAIL;
+  STATE.identified = true;
+  STATE.supervisorName = n;
+  STATE.supervisorEmail = e;
+  STATE.isAdmin = isAdmin;
+  STATE.identifyError = "";
+  const next = [...STATE.accessLog, { id:`A${Date.now()}${Math.random().toString(36).slice(2,6)}`, ts:new Date().toISOString(), name:n, email:e, isAdmin }];
+  STATE.accessLog = next.length > ACCESS_LOG_LIMIT ? next.slice(next.length - ACCESS_LOG_LIMIT) : next;
+  writeState();
+}
 function logout(){
   localStorage.removeItem(ROLE_KEY);
   localStorage.removeItem(SHIFT_KEY);
-  setState({ role: null, shift: null, view: {screen:"home", lineId:null, posteId:null} });
+  setState({ role: null, shift: null, identified:false, supervisorName:"", supervisorEmail:"", isAdmin:false, identifyError:"", view: {screen:"home", lineId:null, posteId:null} });
 }
 
 /* Écrit l'état courant (lignes + historique) dans Firestore ; tous les appareils connectés reçoivent la mise à jour automatiquement */
 function writeState(){
   render();
-  const payload = { lines: STATE.lines, history: STATE.history };
+  const payload = { lines: STATE.lines, history: STATE.history, accessLog: STATE.accessLog };
   setDoc(docRef, { json: JSON.stringify(payload), updatedAt: serverTimestamp() })
     .then(() => { if (STATE.connError) { STATE.connError = ""; render(); } })
     .catch((err) => { STATE.connError = (err && err.message) || "Échec de la synchronisation."; render(); });
@@ -383,9 +411,41 @@ function render(){
     wireEvents();
     return;
   }
+  if (STATE.role === "superviseur" && !STATE.identified) {
+    app.innerHTML = identifyView();
+    if (window.lucide) lucide.createIcons();
+    wireEvents();
+    return;
+  }
   app.innerHTML = header() + connBanner() + body() + modalHtml();
   if (window.lucide) lucide.createIcons();
   wireEvents();
+}
+
+function identifyView(){
+  return `
+  <div class="min-h-screen flex items-center justify-center px-5">
+    <div class="w-full max-w-sm">
+      <div class="flex flex-col items-center mb-8">
+        <i data-lucide="id-card" width="32" height="32" style="color:var(--accent);"></i>
+        <h1 class="text-xl font-semibold uppercase tracking-wide mt-3">Identification</h1>
+        <p class="text-sm mt-1 text-center" style="color:var(--muted);">Requis à chaque connexion, pour la traçabilité</p>
+      </div>
+      <div class="rounded-lg border p-4" style="background:var(--surface); border-color:var(--border);">
+        <label class="text-xs block mb-1" style="color:var(--muted);">Nom</label>
+        <input id="identify-name" placeholder="Votre nom" class="w-full rounded border px-3 py-2 text-sm mb-3 outline-none" style="background:var(--base); border-color:var(--border); color:var(--text);" />
+        <label class="text-xs block mb-1" style="color:var(--muted);">E-mail</label>
+        <input id="identify-email" type="email" placeholder="vous@exemple.com" class="w-full rounded border px-3 py-2 text-sm mb-2 outline-none" style="background:var(--base); border-color:var(--border); color:var(--text);" />
+        ${STATE.identifyError ? `<p class="text-xs mb-2" style="color:var(--nok);">${esc(STATE.identifyError)}</p>` : ""}
+        <button data-action="confirm-identity" class="w-full text-sm rounded px-3 py-2 hover:brightness-110" style="background:var(--accent); color:#fff;">
+          Continuer
+        </button>
+      </div>
+      <button data-action="logout" class="w-full text-xs mt-3 hover:text-white transition-colors" style="color:var(--muted);">
+        ← Changer de profil
+      </button>
+    </div>
+  </div>`;
 }
 
 function shiftView(){
@@ -453,6 +513,7 @@ function header(){
   if (v.screen === "dashboard") title = "Tableau de bord";
   if (v.screen === "stats") title = "Statistiques";
   if (v.screen === "history") title = "Historique";
+  if (v.screen === "access-log") title = "Connexions";
   if (v.screen === "line") { const l = findLine(v.lineId); title = l ? l.name : ""; subtitle = l ? l.subtitle : ""; }
   if (v.screen === "poste") { const l = findLine(v.lineId); const p = findPoste(v.lineId, v.posteId); title = p ? p.name : ""; subtitle = l ? `${l.name} · ${l.subtitle}` : ""; }
 
@@ -484,10 +545,16 @@ function header(){
         <i data-lucide="list-checks" width="16" height="16"></i>
       </button>` : "";
 
+  const accessLogBtn = STATE.isAdmin ? `
+      <button data-action="goto-access-log" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110 ${v.screen==="access-log" ? "" : "border"}"
+        style="${v.screen==="access-log" ? "background:var(--accent);color:#fff;" : "border-color:var(--border);color:var(--text);"}" title="Journal des connexions (admin)">
+        <i data-lucide="user-check" width="16" height="16"></i>
+      </button>` : "";
+
   const roleBadge = `
-    <span class="text-xs px-2 py-1 rounded flex items-center gap-1" style="color:var(--muted); border:1px solid var(--border);">
-      <i data-lucide="${STATE.role === "superviseur" ? "shield" : "user"}" width="12" height="12"></i>
-      ${STATE.role === "superviseur" ? "Superviseur" : `Opérateur · ${esc(STATE.shift || "")}`}
+    <span class="text-xs px-2 py-1 rounded flex items-center gap-1" style="color:var(--muted); border:1px solid var(--border);" title="${esc(STATE.role==='superviseur' ? STATE.supervisorName+' · '+STATE.supervisorEmail : '')}">
+      <i data-lucide="${STATE.role === "superviseur" ? (STATE.isAdmin ? "crown" : "shield") : "user"}" width="12" height="12"></i>
+      ${STATE.role === "superviseur" ? (STATE.isAdmin ? "Admin" : "Superviseur") : `Opérateur · ${esc(STATE.shift || "")}`}
     </span>
     <button data-action="logout" style="color:var(--muted);" class="hover:text-white transition-colors p-1" title="Changer de profil">
       <i data-lucide="log-out" width="16" height="16"></i>
@@ -508,6 +575,7 @@ function header(){
     <div class="ml-auto flex items-center gap-2">
       ${topActions}
       ${indicatorsBtn}
+      ${accessLogBtn}
       ${roleBadge}
     </div>
   </header>`;
@@ -530,6 +598,7 @@ function body(){
   if (v.screen === "dashboard") return dashboardView();
   if (v.screen === "stats") return statsView();
   if (v.screen === "history") return historyView();
+  if (v.screen === "access-log") return accessLogView();
   return "";
 }
 
@@ -881,6 +950,54 @@ function exportHistoryCsv(){
   URL.revokeObjectURL(url);
 }
 
+/* ---------- Journal des connexions (admin uniquement) ---------- */
+function accessLogView(){
+  const entries = [...STATE.accessLog].reverse();
+  const rows = entries.length === 0
+    ? `<div class="rounded-lg border p-6 flex flex-col items-center text-center gap-2" style="background:var(--surface); border-color:var(--border); color:var(--muted);">
+        <i data-lucide="user-check" width="22" height="22"></i>
+        <p class="text-sm">Aucune connexion enregistrée pour le moment.</p>
+      </div>`
+    : entries.map(a => `
+      <div class="rounded-lg border p-3.5 flex items-start justify-between gap-2" style="background:var(--surface); border-color:var(--border);">
+        <span class="flex items-center gap-2">
+          <i data-lucide="${a.isAdmin ? "crown" : "shield"}" width="14" height="14" style="color:var(--accent);"></i>
+          <span>
+            <span class="text-sm font-medium block">${esc(a.name)} ${a.isAdmin ? `<span class="text-xs" style="color:var(--accent);">(admin)</span>` : ""}</span>
+            <span class="text-xs" style="color:var(--muted);">${esc(a.email)}</span>
+          </span>
+        </span>
+        <span class="text-xs mono whitespace-nowrap" style="color:var(--muted);">${formatDateTime(a.ts)}</span>
+      </div>`).join("");
+
+  return `
+  <main class="p-5 max-w-2xl">
+    <div class="flex items-center justify-between mb-4">
+      <p class="text-sm" style="color:var(--muted);">${entries.length} connexion${entries.length>1?"s":""} superviseur (les ${ACCESS_LOG_LIMIT} plus récentes sont conservées).</p>
+      <button data-action="export-access-log-csv" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110 border" style="border-color:var(--border); color:var(--text);">
+        <i data-lucide="download" width="14" height="14"></i> Exporter CSV
+      </button>
+    </div>
+    <div class="flex flex-col gap-2">${rows}</div>
+  </main>`;
+}
+
+function exportAccessLogCsv(){
+  const header = ["Date","Nom","E-mail","Admin"];
+  const lines = STATE.accessLog.map(a => [formatDateTime(a.ts), a.name, a.email, a.isAdmin ? "Oui" : "Non"]);
+  const csvEscape = v => `"${String(v).replace(/"/g,'""')}"`;
+  const csv = [header, ...lines].map(row => row.map(csvEscape).join(";")).join("\n");
+  const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `connexions-superviseur-${new Date().toISOString().slice(0,10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 function modalHtml(){
   const m = STATE.modal;
   if (!m) return "";
@@ -1006,6 +1123,12 @@ function wireEvents(){
           break;
         }
         case "choose-shift": chooseShift(shift); break;
+        case "confirm-identity": {
+          const name = document.getElementById("identify-name").value;
+          const email = document.getElementById("identify-email").value;
+          confirmIdentity(name, email);
+          break;
+        }
         case "logout": logout(); break;
         case "back":
           if (STATE.view.screen === "poste") navigate({screen:"line", lineId: STATE.view.lineId, posteId:null});
@@ -1021,6 +1144,10 @@ function wireEvents(){
           navigate(STATE.view.screen==="history" ? {screen:"home", lineId:null, posteId:null} : {screen:"history", lineId:null, posteId:null});
           break;
         case "export-history-csv": exportHistoryCsv(); break;
+        case "goto-access-log":
+          navigate(STATE.view.screen==="access-log" ? {screen:"home", lineId:null, posteId:null} : {screen:"access-log", lineId:null, posteId:null});
+          break;
+        case "export-access-log-csv": exportAccessLogCsv(); break;
         case "goto-line": navigate({screen:"line", lineId, posteId:null}); break;
         case "goto-poste": navigate({screen:"poste", lineId, posteId}); break;
         case "retry-save": persist(STATE.lines); break;
