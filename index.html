@@ -49,7 +49,6 @@ const firebaseConfig = {
 const fbApp = initializeApp(firebaseConfig);
 const db = getFirestore(fbApp);
 const docRef = doc(db, "app", "production-lines");
-const supRef = doc(db, "app", "supervisors"); // liste des superviseurs (document séparé)
 
 /* ---------- Données ---------- */
 const DEFAULT_INDICATORS = ["État 5S", "Connexion ESD", "Affichage E/S", "Traçabilité", "Sécurité machine"];
@@ -171,10 +170,18 @@ onSnapshot(docRef, (snap) => {
         STATE.lines = normalizeLines(raw);
         STATE.history = [];
         STATE.accessLog = [];
+        STATE.supervisors = [];
       } else {
         STATE.lines = normalizeLines(raw.lines || []);
         STATE.history = raw.history || [];
         STATE.accessLog = raw.accessLog || [];
+        STATE.supervisors = Array.isArray(raw.supervisors) ? raw.supervisors : [];
+      }
+      /* Si l'admin retire un superviseur, sa session est fermée */
+      if (STATE.role === "superviseur" && !STATE.isAdmin && !STATE.supervisors.some(x => x.id === STATE.supervisorId)) {
+        STATE.role = null; STATE.identified = false; STATE.supervisorName = ""; STATE.supervisorId = null;
+        STATE.view = { screen:"home", lineId:null, posteId:null }; STATE.modal = null;
+        STATE.loginError = "Votre accès superviseur a été retiré par l'administrateur.";
       }
     } catch(e) { /* ignore malformed payload */ }
   } else {
@@ -182,7 +189,8 @@ onSnapshot(docRef, (snap) => {
     STATE.lines = seeded;
     STATE.history = [];
     STATE.accessLog = [];
-    setDoc(docRef, { json: JSON.stringify({ lines: seeded, history: [], accessLog: [] }), updatedAt: serverTimestamp() }).catch(()=>{});
+    STATE.supervisors = [];
+    setDoc(docRef, { json: JSON.stringify({ lines: seeded, history: [], accessLog: [], supervisors: [] }), updatedAt: serverTimestamp() }).catch(()=>{});
   }
   STATE.loading = false;
   STATE.connError = "";
@@ -192,19 +200,6 @@ onSnapshot(docRef, (snap) => {
   STATE.connError = (error && error.message) || "Connexion à la base de données impossible.";
   render();
 });
-
-/* Liste des superviseurs, en temps réel : si l'admin retire un superviseur, il est déconnecté */
-onSnapshot(supRef, (snap) => {
-  let list = [];
-  try { if (snap.exists() && snap.data().json) list = JSON.parse(snap.data().json).list || []; } catch(e) {}
-  STATE.supervisors = list;
-  if (STATE.role === "superviseur" && !STATE.isAdmin && !list.some(x => x.id === STATE.supervisorId)) {
-    STATE.role = null; STATE.identified = false; STATE.supervisorName = ""; STATE.supervisorId = null;
-    STATE.view = { screen:"home", lineId:null, posteId:null }; STATE.modal = null;
-    STATE.loginError = "Votre accès superviseur a été retiré par l'administrateur.";
-  }
-  render();
-}, () => {});
 
 function setState(patch){ Object.assign(STATE, patch); render(); }
 function navigate(view){
@@ -278,9 +273,7 @@ async function tryLoginAdmin(email, code){
 /* ---------- Gestion des superviseurs (admin uniquement) ---------- */
 function writeSupervisors(list){
   STATE.supervisors = list;
-  render();
-  setDoc(supRef, { json: JSON.stringify({ list }), updatedAt: serverTimestamp() })
-    .catch((err) => { STATE.supError = (err && err.message) || "Échec de l'enregistrement."; render(); });
+  writeState(); // la liste est enregistrée dans le même document que les lignes
 }
 async function addSupervisor(name, code){
   if (!STATE.isAdmin) return;
@@ -332,7 +325,7 @@ function logout(){
 /* Écrit l'état courant (lignes + historique) dans Firestore ; tous les appareils connectés reçoivent la mise à jour automatiquement */
 function writeState(){
   render();
-  const payload = { lines: STATE.lines, history: STATE.history, accessLog: STATE.accessLog };
+  const payload = { lines: STATE.lines, history: STATE.history, accessLog: STATE.accessLog, supervisors: STATE.supervisors };
   setDoc(docRef, { json: JSON.stringify(payload), updatedAt: serverTimestamp() })
     .then(() => { if (STATE.connError) { STATE.connError = ""; render(); } })
     .catch((err) => { STATE.connError = (err && err.message) || "Échec de la synchronisation."; render(); });
