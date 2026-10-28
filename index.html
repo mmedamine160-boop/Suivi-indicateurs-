@@ -118,6 +118,10 @@ const SHIFT_KEY = "suivi-production-shift";
 const HISTORY_LIMIT = 300;
 const ACCESS_LOG_LIMIT = 300;
 const ADMIN_EMAIL = "mmedamine160@gmail.com";
+/* Le superviseur consulte seulement (tableau de bord, statistiques, historique, exports).
+   Seul l'admin peut créer / renommer / supprimer des lignes, postes et types d'indicateurs. */
+const ADMIN_ONLY_EDIT = true;
+function canEdit(){ return STATE.role === "superviseur" && (STATE.isAdmin || !ADMIN_ONLY_EDIT); }
 let STATE = {
   lines: [],
   history: [], // journal des passages OK/NOK
@@ -177,7 +181,7 @@ function navigate(view){
 }
 function openModal(modal){
   // Ajout/modification de lignes et postes réservés au superviseur ; motif NOK réservé à l'opérateur
-  if (["add-line","edit-line","edit-poste","add-poste","manage-indicators"].includes(modal.type) && STATE.role !== "superviseur") return;
+  if (["add-line","edit-line","edit-poste","add-poste","manage-indicators"].includes(modal.type) && !canEdit()) return;
   if (modal.type === "nok-reason" && STATE.role !== "operateur") return;
   setState({ modal });
 }
@@ -318,19 +322,23 @@ function resolveOk(lineId, posteId, shift, indicatorId){
   writeState();
 }
 function renameLine(lineId, name, subtitle){
+  if (!canEdit()) return;
   persist(STATE.lines.map(l => l.id===lineId ? {...l, name, subtitle} : l));
   closeModal();
 }
 function renamePoste(lineId, posteId, name){
+  if (!canEdit()) return;
   persist(STATE.lines.map(l => l.id!==lineId ? l : {...l, postes: l.postes.map(p=>p.id===posteId?{...p,name}:p)}));
   closeModal();
 }
 function addLine(name, subtitle){
+  if (!canEdit()) return;
   const id = `L${Date.now()}`;
   persist([...STATE.lines, {id, name, subtitle, postes: []}]);
   closeModal();
 }
 function deleteLine(lineId){
+  if (!canEdit()) return;
   const l = findLine(lineId);
   if (!l) return;
   if (!confirm(`Supprimer la ligne « ${l.name} » et tous ses postes ? Cette action est irréversible.`)) return;
@@ -338,6 +346,7 @@ function deleteLine(lineId){
   if (STATE.view.lineId === lineId) navigate({screen:"home", lineId:null, posteId:null});
 }
 function addPoste(lineId, name){
+  if (!canEdit()) return;
   const id = `${lineId}-P${Date.now()}`;
   const names = allIndicatorNames();
   const shifts = {};
@@ -347,6 +356,7 @@ function addPoste(lineId, name){
   closeModal();
 }
 function deletePoste(lineId, posteId){
+  if (!canEdit()) return;
   const p = findPoste(lineId, posteId);
   if (!p) return;
   if (!confirm(`Supprimer le poste « ${p.name} » ? Cette action est irréversible.`)) return;
@@ -356,6 +366,7 @@ function deletePoste(lineId, posteId){
 
 /* ---------- Gestion des types d'indicateurs (superviseur) : s'applique à tous les postes ---------- */
 function addIndicatorType(name){
+  if (!canEdit()) return;
   const trimmed = (name||"").trim();
   if (!trimmed) return;
   if (allIndicatorNames().includes(trimmed)) return;
@@ -373,6 +384,7 @@ function addIndicatorType(name){
   persist(next);
 }
 function renameIndicatorType(oldName, newName){
+  if (!canEdit()) return;
   const trimmed = (newName||"").trim();
   if (!trimmed || trimmed === oldName) return;
   const next = STATE.lines.map(line => ({
@@ -386,6 +398,7 @@ function renameIndicatorType(oldName, newName){
   persist(next);
 }
 function deleteIndicatorType(name){
+  if (!canEdit()) return;
   if (allIndicatorNames().length <= 1) { alert("Il doit rester au moins un indicateur."); return; }
   if (!confirm(`Supprimer l'indicateur « ${name} » de tous les postes et tous les shifts ? Cette action est irréversible.`)) return;
   const next = STATE.lines.map(line => ({
@@ -545,12 +558,12 @@ function header(){
         style="${v.screen==="history" ? "background:var(--accent);color:#fff;" : "border-color:var(--border);color:var(--text);"}">
         <i data-lucide="history" width="16" height="16"></i> Historique
       </button>
-      ${v.screen === "home" ? `
+      ${v.screen === "home" && canEdit() ? `
       <button data-action="open-add-line" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110" style="background:var(--accent);color:#fff;">
         <i data-lucide="plus" width="16" height="16"></i> Nouvelle ligne
       </button>` : ""}` : "";
 
-  const indicatorsBtn = STATE.role === "superviseur" ? `
+  const indicatorsBtn = canEdit() ? `
       <button data-action="open-manage-indicators" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110 border" style="border-color:var(--border);color:var(--text);" title="Gérer les indicateurs">
         <i data-lucide="list-checks" width="16" height="16"></i>
       </button>` : "";
@@ -627,7 +640,7 @@ function homeView(){
             <p class="text-sm mt-0.5" style="color:var(--muted);">${esc(line.subtitle||"")}</p>
           </div>
           <div class="flex items-center gap-1 mt-1">
-            ${STATE.role === "superviseur" ? `
+            ${canEdit() ? `
             <span data-action="delete-line" data-line="${line.id}" class="hover:text-white transition-colors p-1" style="color:var(--muted);" aria-label="Supprimer la ligne">
               <i data-lucide="trash-2" width="15" height="15"></i>
             </span>
@@ -665,7 +678,7 @@ function lineView(){
       <div class="flex items-center justify-between mb-3">
         <span class="flex items-center gap-1.5">
           <h3 class="font-semibold uppercase tracking-wide">${esc(poste.name)}</h3>
-          ${STATE.role === "superviseur" ? `
+          ${canEdit() ? `
           <button data-action="delete-poste" data-line="${line.id}" data-poste="${poste.id}" class="hover:text-white transition-colors p-0.5" style="color:var(--muted);" aria-label="Supprimer le poste">
             <i data-lucide="trash-2" width="13" height="13"></i>
           </button>
@@ -683,7 +696,7 @@ function lineView(){
     </div>`;
   }).join("");
 
-  const addTile = STATE.role === "superviseur" ? `
+  const addTile = canEdit() ? `
     <button data-action="open-add-poste" data-line="${line.id}" class="rounded-lg border border-dashed p-4 flex items-center justify-center gap-2 hover:brightness-110 transition-all text-sm"
       style="border-color:var(--border); color:var(--muted);">
       <i data-lucide="plus" width="16" height="16"></i> Ajouter un poste
