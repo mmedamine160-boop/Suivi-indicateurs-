@@ -49,6 +49,14 @@ const docRef = doc(db, "app", "production-lines");
 /* ---------- Données ---------- */
 const DEFAULT_INDICATORS = ["État 5S", "Connexion ESD", "Affichage E/S", "Traçabilité", "Sécurité machine"];
 const SHIFTS = ["Shift 1", "Shift 2", "Shift 3"];
+/* Horaires des shifts (heure locale de l'appareil) : [heure de début, heure de fin]. Modifiables ici. */
+const SHIFT_HOURS = { "Shift 1":[6,14], "Shift 2":[14,22], "Shift 3":[22,6] };
+function currentShift(d = new Date()){
+  const h = d.getHours() + d.getMinutes()/60;
+  for (const s of SHIFTS){ const [a,b] = SHIFT_HOURS[s]; if (a < b ? (h >= a && h < b) : (h >= a || h < b)) return s; }
+  return SHIFTS[0];
+}
+function shiftHoursLabel(s){ const [a,b] = SHIFT_HOURS[s]; return `${String(a).padStart(2,"0")}h–${String(b).padStart(2,"0")}h`; }
 
 function makeShiftIndicators(posteId, shift, names){
   names = names || DEFAULT_INDICATORS;
@@ -117,7 +125,7 @@ let STATE = {
   loading: true,
   connError: "",
   role: localStorage.getItem(ROLE_KEY) || null, // "superviseur" | "operateur" | null
-  shift: localStorage.getItem(SHIFT_KEY) || null, // "Shift 1" | "Shift 2" | "Shift 3" | null
+  shift: currentShift(), // automatique selon l'heure actuelle (voir SHIFT_HOURS)
   identified: false, // le superviseur doit s'identifier (nom + e-mail) à chaque connexion
   supervisorName: "",
   supervisorEmail: "",
@@ -282,10 +290,11 @@ function updateIndicator(lineId, posteId, shift, indicatorId, patch){
 }
 /* Clic sur un indicateur OK : demande un motif obligatoire avant de passer en NOK */
 function requestNok(lineId, posteId, shift, indicatorId){
-  if (STATE.role !== "operateur" || shift !== STATE.shift) return;
+  if (STATE.role !== "operateur" || shift !== currentShift()) return;
   openModal({ type:"nok-reason", lineId, posteId, shift, indicatorId });
 }
 function confirmNok(lineId, posteId, shift, indicatorId, comment){
+  if (STATE.role !== "operateur" || shift !== currentShift()) { STATE.modal = null; render(); alert("Ce shift est terminé : vous ne pouvez modifier que le shift en cours."); return; }
   const trimmed = (comment||"").trim();
   if (!trimmed) { alert("Un motif est obligatoire pour déclarer une anomalie."); return; }
   const line = findLine(lineId), poste = findPoste(lineId, posteId), ind = findIndicator(lineId, posteId, shift, indicatorId);
@@ -299,7 +308,7 @@ function confirmNok(lineId, posteId, shift, indicatorId, comment){
 }
 /* Clic sur un indicateur NOK : repasse en OK directement, calcule et journalise la durée de résolution */
 function resolveOk(lineId, posteId, shift, indicatorId){
-  if (STATE.role !== "operateur" || shift !== STATE.shift) return;
+  if (STATE.role !== "operateur" || shift !== currentShift()) return;
   const line = findLine(lineId), poste = findPoste(lineId, posteId), ind = findIndicator(lineId, posteId, shift, indicatorId);
   if (!line || !poste || !ind || ind.status !== "NOK") return;
   const durationMs = ind.openedAt ? (Date.now() - new Date(ind.openedAt).getTime()) : null;
@@ -405,6 +414,7 @@ function render(){
     wireEvents();
     return;
   }
+  if (STATE.role === "operateur") STATE.shift = currentShift(); // le shift suit l'heure actuelle
   if (STATE.role === "operateur" && !STATE.shift) {
     app.innerHTML = shiftView();
     if (window.lucide) lucide.createIcons();
@@ -708,11 +718,26 @@ function posteView(){
   };
 
   if (STATE.role === "operateur") {
-    const rows = (poste.shifts[STATE.shift] || []).map(ind => renderRow(ind, STATE.shift, true)).join("");
+    // L'opérateur consulte tous les shifts mais ne modifie que le shift correspondant à l'heure actuelle
+    const cur = currentShift();
+    const order = [cur, ...SHIFTS.filter(s => s !== cur)];
+    const secs = order.map(s => {
+      const mine = s === cur;
+      const rows = (poste.shifts[s] || []).map(ind => renderRow(ind, s, mine)).join("");
+      return `
+      <div class="mb-6">
+        <h2 class="text-sm font-semibold uppercase tracking-wide mb-2 flex items-center gap-2" style="color:${mine?"var(--text)":"var(--muted)"};">
+          <i data-lucide="clock" width="14" height="14"></i> ${esc(s)}
+          <span class="mono text-[10px] font-normal">${shiftHoursLabel(s)}</span>
+          <span class="text-[10px] px-1.5 py-0.5 rounded font-medium" style="background:${mine?"rgba(59,130,196,0.2)":"rgba(139,145,152,0.15)"}; color:${mine?"var(--accent)":"var(--muted)"};">${mine ? "Shift en cours · modifiable" : "Lecture seule"}</span>
+        </h2>
+        <div class="flex flex-col gap-2">${rows}</div>
+      </div>`;
+    }).join("");
     return `
     <main class="p-5 max-w-xl">
-      <p class="text-sm mb-4" style="color:var(--muted);">${esc(STATE.shift)} — cliquez sur un indicateur OK pour déclarer une anomalie (motif requis), ou sur un NOK pour le résoudre.</p>
-      <div class="flex flex-col gap-2">${rows}</div>
+      <p class="text-sm mb-4" style="color:var(--muted);">${esc(cur)} (${shiftHoursLabel(cur)}) — cliquez sur un indicateur OK pour déclarer une anomalie (motif requis), ou sur un NOK pour le résoudre. Les autres shifts sont consultables mais non modifiables.</p>
+      ${secs}
     </main>`;
   }
 
@@ -1206,6 +1231,11 @@ function wireEvents(){
 }
 
 render();
+
+/* Le shift suit l'heure : à chaque changement de shift, l'écran de l'opérateur se met à jour tout seul */
+setInterval(() => {
+  if (STATE.role === "operateur" && STATE.shift !== currentShift()) { STATE.modal = null; render(); }
+}, 30000);
 
 /* ---------- Enregistrement du service worker (offline / installable) ---------- */
 if ("serviceWorker" in navigator && (location.protocol === "https:" || location.hostname === "localhost")) {
