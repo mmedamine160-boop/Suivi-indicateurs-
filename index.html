@@ -45,6 +45,7 @@ const firebaseConfig = {
 const fbApp = initializeApp(firebaseConfig);
 const db = getFirestore(fbApp);
 const docRef = doc(db, "app", "production-lines");
+const supRef = doc(db, "app", "supervisors"); // liste des superviseurs (document séparé)
 
 /* ---------- Données ---------- */
 const DEFAULT_INDICATORS = ["État 5S", "Connexion ESD", "Affichage E/S", "Traçabilité", "Sécurité machine"];
@@ -110,7 +111,6 @@ function normalizeLines(lines){
 }
 
 /* ---------- Accès superviseur / opérateur ---------- */
-const SUPERVISOR_PIN = "2909";
 const ROLE_KEY = "suivi-production-role";
 const SHIFT_KEY = "suivi-production-shift";
 
@@ -118,17 +118,34 @@ const SHIFT_KEY = "suivi-production-shift";
 const HISTORY_LIMIT = 300;
 const ACCESS_LOG_LIMIT = 300;
 const ADMIN_EMAIL = "mmedamine160@gmail.com";
-/* Le superviseur consulte seulement (tableau de bord, statistiques, historique, exports).
-   Seul l'admin peut créer / renommer / supprimer des lignes, postes et types d'indicateurs. */
-const ADMIN_ONLY_EDIT = true;
-function canEdit(){ return STATE.role === "superviseur" && (STATE.isAdmin || !ADMIN_ONLY_EDIT); }
+/* Administrateur : e-mail + code admin secret (seule l'empreinte du code est stockée ici).
+   Superviseurs : créés par l'admin (nom + code d'accès), stockés sous forme d'empreintes. */
+const ADMIN_SALT = "2f2b26a368e3aa847e170f8934be946e";
+const ADMIN_CODE_HASH = "4ad99c66dc94fa7348c47bbbda9e496437de889cbbb24d638a6b8907df6851f3";
+const LOGIN_LOCK_KEY = "suivi-production-login-lock";
+async function hashCode(code, salt){
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(code), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name:"PBKDF2", salt: enc.encode(salt), iterations:100000, hash:"SHA-256" }, key, 256);
+  return Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2,"0")).join("");
+}
+/* Tout superviseur (admin compris) peut créer / modifier / supprimer lignes, postes et indicateurs.
+   Seul l'admin gère la liste des superviseurs. */
+function canEdit(){ return STATE.role === "superviseur"; }
 let STATE = {
   lines: [],
   history: [], // journal des passages OK/NOK
   accessLog: [], // journal des connexions superviseur (nom, e-mail, date)
+  supervisors: [], // [{id, name, salt, hash, createdAt}] — géré par l'admin
+  supervisorId: null,
+  loginMode: "sup", // "sup" | "admin"
+  supError: "",
+  svName: "", svCode: "", // brouillon du formulaire « nouveau superviseur » (conservé en cas d'erreur)
+  loginName: "", loginEmail: "",
+  supOk: "",
   loading: true,
   connError: "",
-  role: localStorage.getItem(ROLE_KEY) || null, // "superviseur" | "operateur" | null
+  role: localStorage.getItem(ROLE_KEY) === "operateur" ? "operateur" : null, // seul l'opérateur reste connecté ; le superviseur se reconnecte à chaque fois
   shift: currentShift(), // automatique selon l'heure actuelle (voir SHIFT_HOURS)
   identified: false, // le superviseur doit s'identifier (nom + e-mail) à chaque connexion
   supervisorName: "",
@@ -172,11 +189,25 @@ onSnapshot(docRef, (snap) => {
   render();
 });
 
+/* Liste des superviseurs, en temps réel : si l'admin retire un superviseur, il est déconnecté */
+onSnapshot(supRef, (snap) => {
+  let list = [];
+  try { if (snap.exists() && snap.data().json) list = JSON.parse(snap.data().json).list || []; } catch(e) {}
+  STATE.supervisors = list;
+  if (STATE.role === "superviseur" && !STATE.isAdmin && !list.some(x => x.id === STATE.supervisorId)) {
+    STATE.role = null; STATE.identified = false; STATE.supervisorName = ""; STATE.supervisorId = null;
+    STATE.view = { screen:"home", lineId:null, posteId:null }; STATE.modal = null;
+    STATE.loginError = "Votre accès superviseur a été retiré par l'administrateur.";
+  }
+  render();
+}, () => {});
+
 function setState(patch){ Object.assign(STATE, patch); render(); }
 function navigate(view){
   // Un opérateur ne peut pas accéder au tableau de bord ; le journal des connexions est réservé à l'admin
   if ((view.screen === "dashboard" || view.screen === "stats" || view.screen === "history") && STATE.role !== "superviseur") return;
-  if (view.screen === "access-log" && !STATE.isAdmin) return;
+  if (view.screen === "access-log" && STATE.role !== "superviseur") return;
+  if (view.screen === "supervisors" && !STATE.isAdmin) return;
   setState({ view });
 }
 function openModal(modal){
@@ -190,13 +221,83 @@ function loginAsOperateur(){
   localStorage.setItem(ROLE_KEY, "operateur");
   setState({ role: "operateur", loginError: "" });
 }
-function tryLoginSuperviseur(pin){
-  if (pin === SUPERVISOR_PIN) {
-    localStorage.setItem(ROLE_KEY, "superviseur");
-    setState({ role: "superviseur", loginError: "", modal: null });
-  } else {
-    setState({ loginError: "Code incorrect." });
-  }
+/* Anti-force-brute : 5 essais ratés = blocage de 60 secondes sur cet appareil */
+function loginLocked(){
+  let until = 0; try { until = +localStorage.getItem(LOGIN_LOCK_KEY) || 0; } catch(e) {}
+  return until > Date.now() ? Math.ceil((until - Date.now())/1000) : 0;
+}
+let loginFails = 0;
+function loginFailed(msg){
+  loginFails++;
+  if (loginFails >= 5) { loginFails = 0; try { localStorage.setItem(LOGIN_LOCK_KEY, String(Date.now() + 60000)); } catch(e) {} msg = "Trop d'essais. Réessayez dans 60 secondes."; }
+  setState({ loginError: msg });
+}
+function openSupervisorSession({ name, email, isAdmin, id }){
+  STATE.identified = true;
+  STATE.supervisorName = name;
+  STATE.supervisorEmail = email || "";
+  STATE.supervisorId = id || null;
+  STATE.loginName = ""; STATE.loginEmail = "";
+  STATE.isAdmin = isAdmin;
+  STATE.loginError = "";
+  const next = [...STATE.accessLog, { id:`A${Date.now()}${Math.random().toString(36).slice(2,6)}`, ts:new Date().toISOString(), name, email: email || "", isAdmin }];
+  STATE.accessLog = next.length > ACCESS_LOG_LIMIT ? next.slice(next.length - ACCESS_LOG_LIMIT) : next;
+  STATE.role = "superviseur";
+  STATE.view = { screen:"home", lineId:null, posteId:null };
+  writeState();
+}
+async function tryLoginSuperviseur(name, code){
+  const wait = loginLocked();
+  if (wait) { setState({ loginError: `Trop d'essais. Réessayez dans ${wait} s.` }); return; }
+  const n = (name||"").trim(), c = (code||"").trim();
+  STATE.loginName = n;
+  if (!n || !c) { setState({ loginError: "Saisissez votre nom et votre code d'accès." }); return; }
+  const sup = STATE.supervisors.find(x => x.name.trim().toLowerCase() === n.toLowerCase());
+  let ok = false;
+  if (sup) { try { ok = (await hashCode(c, sup.salt)) === sup.hash; } catch(e) {} }
+  if (!ok) { loginFailed("Nom ou code d'accès incorrect."); return; }
+  loginFails = 0;
+  openSupervisorSession({ name: sup.name, isAdmin:false, id: sup.id });
+}
+async function tryLoginAdmin(email, code){
+  const wait = loginLocked();
+  if (wait) { setState({ loginError: `Trop d'essais. Réessayez dans ${wait} s.` }); return; }
+  const e = (email||"").trim().toLowerCase(), c = (code||"").trim();
+  STATE.loginEmail = (email||"").trim();
+  let ok = false;
+  if (e && c && e === ADMIN_EMAIL.toLowerCase()) { try { ok = (await hashCode(c, ADMIN_SALT)) === ADMIN_CODE_HASH; } catch(err) {} }
+  if (!ok) { loginFailed("E-mail ou code admin incorrect."); return; }
+  loginFails = 0;
+  openSupervisorSession({ name:"Administrateur", email: ADMIN_EMAIL, isAdmin:true, id:"admin" });
+}
+
+/* ---------- Gestion des superviseurs (admin uniquement) ---------- */
+function writeSupervisors(list){
+  STATE.supervisors = list;
+  render();
+  setDoc(supRef, { json: JSON.stringify({ list }), updatedAt: serverTimestamp() })
+    .catch((err) => { STATE.supError = (err && err.message) || "Échec de l'enregistrement."; render(); });
+}
+async function addSupervisor(name, code){
+  if (!STATE.isAdmin) return;
+  const n = (name||"").trim(), c = (code||"").trim();
+  STATE.svName = n; STATE.svCode = c;
+  if (n.length < 2) { setState({ supError:"Saisissez le nom du superviseur (2 caractères minimum).", supOk:"" }); return; }
+  if (c.length < 4) { setState({ supError:"Le code d'accès doit faire 4 caractères minimum.", supOk:"" }); return; }
+  if (STATE.supervisors.some(x => x.name.trim().toLowerCase() === n.toLowerCase())) { setState({ supError:"Un superviseur porte déjà ce nom.", supOk:"" }); return; }
+  const salt = Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b => b.toString(16).padStart(2,"0")).join("");
+  const hash = await hashCode(c, salt);
+  STATE.svName = ""; STATE.svCode = "";
+  STATE.supError = ""; STATE.supOk = `« ${n} » ajouté. Communiquez-lui son code d'accès.`;
+  writeSupervisors([...STATE.supervisors, { id:`S${Date.now()}${Math.random().toString(36).slice(2,6)}`, name:n, salt, hash, createdAt:new Date().toISOString() }]);
+}
+function deleteSupervisor(id){
+  if (!STATE.isAdmin) return;
+  const sup = STATE.supervisors.find(x => x.id === id);
+  if (!sup) return;
+  if (!confirm(`Retirer l'accès du superviseur « ${sup.name} » ?`)) return;
+  STATE.supError = ""; STATE.supOk = `« ${sup.name} » retiré.`;
+  writeSupervisors(STATE.supervisors.filter(x => x.id !== id));
 }
 function chooseShift(shift){
   localStorage.setItem(SHIFT_KEY, shift);
@@ -221,7 +322,7 @@ function confirmIdentity(name, email){
 function logout(){
   localStorage.removeItem(ROLE_KEY);
   localStorage.removeItem(SHIFT_KEY);
-  setState({ role: null, shift: null, identified:false, supervisorName:"", supervisorEmail:"", isAdmin:false, identifyError:"", view: {screen:"home", lineId:null, posteId:null} });
+  setState({ role: null, shift: null, identified:false, supervisorName:"", supervisorEmail:"", isAdmin:false, identifyError:"", loginName:"", loginEmail:"", loginError:"", loginMode:"sup", supError:"", supOk:"", svName:"", svCode:"", view: {screen:"home", lineId:null, posteId:null} });
 }
 
 /* Écrit l'état courant (lignes + historique) dans Firestore ; tous les appareils connectés reçoivent la mise à jour automatiquement */
@@ -510,21 +611,35 @@ function loginView(){
           <span class="block text-xs" style="color:var(--muted);">Accès direct, sans code</span>
         </span>
       </button>
+      ${STATE.loginMode === "admin" ? `
+      <div class="rounded-lg border p-4" style="background:var(--surface); border-color:var(--border);">
+        <span class="flex items-center gap-3 mb-3">
+          <i data-lucide="crown" width="20" height="20" style="color:var(--accent);"></i>
+          <span>
+            <span class="block font-medium">Administrateur</span>
+            <span class="block text-xs" style="color:var(--muted);">E-mail et code admin</span>
+          </span>
+        </span>
+        <input id="adm-email" type="email" autocomplete="username" placeholder="E-mail" value="${esc(STATE.loginEmail)}" class="w-full rounded border px-3 py-2 text-sm mb-2 outline-none" style="background:var(--base); border-color:var(--border); color:var(--text);" />
+        <input id="adm-code" type="password" autocomplete="current-password" placeholder="Code admin" class="w-full rounded border px-3 py-2 text-sm mb-2 outline-none" style="background:var(--base); border-color:var(--border); color:var(--text);" />
+        ${STATE.loginError ? `<p class="text-xs mb-2" style="color:var(--nok);">${esc(STATE.loginError)}</p>` : ""}
+        <button data-action="login-admin" class="w-full text-sm rounded px-3 py-2 hover:brightness-110" style="background:var(--accent); color:#fff;">Se connecter</button>
+        <button data-action="login-mode" data-mode="sup" class="w-full text-xs mt-3 hover:text-white transition-colors" style="color:var(--muted);">← Connexion superviseur</button>
+      </div>` : `
       <div class="rounded-lg border p-4" style="background:var(--surface); border-color:var(--border);">
         <span class="flex items-center gap-3 mb-3">
           <i data-lucide="shield" width="20" height="20" style="color:var(--accent);"></i>
           <span>
             <span class="block font-medium">Superviseur</span>
-            <span class="block text-xs" style="color:var(--muted);">Nécessite un code</span>
+            <span class="block text-xs" style="color:var(--muted);">Nom et code d'accès</span>
           </span>
         </span>
-        <input id="pin-input" type="password" inputmode="numeric" placeholder="Code" maxlength="8"
-          class="w-full rounded border px-3 py-2 text-sm mb-2 outline-none" style="background:var(--base); border-color:var(--border); color:var(--text);" />
+        <input id="sup-name" autocomplete="username" placeholder="Nom" value="${esc(STATE.loginName)}" class="w-full rounded border px-3 py-2 text-sm mb-2 outline-none" style="background:var(--base); border-color:var(--border); color:var(--text);" />
+        <input id="sup-code" type="password" autocomplete="current-password" placeholder="Code d'accès" class="w-full rounded border px-3 py-2 text-sm mb-2 outline-none" style="background:var(--base); border-color:var(--border); color:var(--text);" />
         ${STATE.loginError ? `<p class="text-xs mb-2" style="color:var(--nok);">${esc(STATE.loginError)}</p>` : ""}
-        <button data-action="login-superviseur" class="w-full text-sm rounded px-3 py-2 hover:brightness-110" style="background:var(--accent); color:#fff;">
-          Se connecter
-        </button>
-      </div>
+        <button data-action="login-superviseur" class="w-full text-sm rounded px-3 py-2 hover:brightness-110" style="background:var(--accent); color:#fff;">Se connecter</button>
+        <button data-action="login-mode" data-mode="admin" class="w-full text-xs mt-3 hover:text-white transition-colors" style="color:var(--muted);">Administrateur →</button>
+      </div>`}
     </div>
   </div>`;
 }
@@ -537,6 +652,7 @@ function header(){
   if (v.screen === "stats") title = "Statistiques";
   if (v.screen === "history") title = "Historique";
   if (v.screen === "access-log") title = "Connexions";
+  if (v.screen === "supervisors") title = "Superviseurs";
   if (v.screen === "line") { const l = findLine(v.lineId); title = l ? l.name : ""; subtitle = l ? l.subtitle : ""; }
   if (v.screen === "poste") { const l = findLine(v.lineId); const p = findPoste(v.lineId, v.posteId); title = p ? p.name : ""; subtitle = l ? `${l.name} · ${l.subtitle}` : ""; }
 
@@ -568,9 +684,15 @@ function header(){
         <i data-lucide="list-checks" width="16" height="16"></i>
       </button>` : "";
 
-  const accessLogBtn = STATE.isAdmin ? `
+  const supervisorsBtn = STATE.isAdmin ? `
+      <button data-action="goto-supervisors" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110 ${v.screen==="supervisors" ? "" : "border"}"
+        style="${v.screen==="supervisors" ? "background:var(--accent);color:#fff;" : "border-color:var(--border);color:var(--text);"}" title="Gérer les superviseurs (admin)">
+        <i data-lucide="users" width="16" height="16"></i>
+      </button>` : "";
+
+  const accessLogBtn = STATE.role === "superviseur" ? `
       <button data-action="goto-access-log" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110 ${v.screen==="access-log" ? "" : "border"}"
-        style="${v.screen==="access-log" ? "background:var(--accent);color:#fff;" : "border-color:var(--border);color:var(--text);"}" title="Journal des connexions (admin)">
+        style="${v.screen==="access-log" ? "background:var(--accent);color:#fff;" : "border-color:var(--border);color:var(--text);"}" title="Journal des connexions">
         <i data-lucide="user-check" width="16" height="16"></i>
       </button>` : "";
 
@@ -598,6 +720,7 @@ function header(){
     <div class="ml-auto flex items-center gap-2">
       ${topActions}
       ${indicatorsBtn}
+      ${supervisorsBtn}
       ${accessLogBtn}
       ${roleBadge}
     </div>
@@ -622,6 +745,7 @@ function body(){
   if (v.screen === "stats") return statsView();
   if (v.screen === "history") return historyView();
   if (v.screen === "access-log") return accessLogView();
+  if (v.screen === "supervisors") return supervisorsView();
   return "";
 }
 
@@ -989,6 +1113,37 @@ function exportHistoryCsv(){
 }
 
 /* ---------- Journal des connexions (admin uniquement) ---------- */
+function supervisorsView(){
+  if (!STATE.isAdmin) return "";
+  const inp = 'class="w-full rounded border px-3 py-2 text-sm mb-2 outline-none" style="background:var(--base); border-color:var(--border); color:var(--text);"';
+  const rows = STATE.supervisors.length === 0
+    ? `<div class="rounded-lg border p-6 text-center text-sm" style="background:var(--surface); border-color:var(--border); color:var(--muted);">Aucun superviseur pour le moment. Ajoutez-en un ci-dessus.</div>`
+    : STATE.supervisors.map(x => `
+      <div class="rounded-lg border p-3.5 flex items-center justify-between gap-2" style="background:var(--surface); border-color:var(--border);">
+        <span class="flex items-center gap-2">
+          <i data-lucide="shield" width="14" height="14" style="color:var(--accent);"></i>
+          <span>
+            <span class="text-sm font-medium block">${esc(x.name)}</span>
+            <span class="text-xs" style="color:var(--muted);">Ajouté le ${formatDateTime(x.createdAt)}</span>
+          </span>
+        </span>
+        <button data-action="delete-supervisor" data-id="${esc(x.id)}" class="text-xs border rounded px-2.5 py-1.5 hover:brightness-125" style="border-color:var(--nok); color:var(--nok);">Retirer</button>
+      </div>`).join("");
+  return `
+  <main class="p-5 max-w-xl">
+    <p class="text-sm mb-4" style="color:var(--muted);">Les superviseurs ont les mêmes droits que vous, sauf la gestion des superviseurs. Ils se connectent avec leur nom et leur code d'accès.</p>
+    <div class="rounded-lg border p-4 mb-5" style="background:var(--surface); border-color:var(--border);">
+      <h2 class="text-sm font-semibold uppercase tracking-wide mb-3">Nouveau superviseur</h2>
+      <input id="sv-name" placeholder="Nom du superviseur" value="${esc(STATE.svName)}" ${inp} />
+      <input id="sv-code" placeholder="Code d'accès (4 caractères minimum)" value="${esc(STATE.svCode)}" ${inp} />
+      ${STATE.supError ? `<p class="text-xs mb-2" style="color:var(--nok);">${esc(STATE.supError)}</p>` : ""}
+      ${STATE.supOk ? `<p class="text-xs mb-2" style="color:var(--ok);">${esc(STATE.supOk)}</p>` : ""}
+      <button data-action="add-supervisor" class="w-full text-sm rounded px-3 py-2 hover:brightness-110" style="background:var(--accent); color:#fff;">Ajouter</button>
+    </div>
+    <div class="flex flex-col gap-2">${rows}</div>
+  </main>`;
+}
+
 function accessLogView(){
   const entries = [...STATE.accessLog].reverse();
   const rows = entries.length === 0
@@ -1002,7 +1157,7 @@ function accessLogView(){
           <i data-lucide="${a.isAdmin ? "crown" : "shield"}" width="14" height="14" style="color:var(--accent);"></i>
           <span>
             <span class="text-sm font-medium block">${esc(a.name)} ${a.isAdmin ? `<span class="text-xs" style="color:var(--accent);">(admin)</span>` : ""}</span>
-            <span class="text-xs" style="color:var(--muted);">${esc(a.email)}</span>
+            <span class="text-xs" style="color:var(--muted);">${esc(a.email || "Superviseur")}</span>
           </span>
         </span>
         <span class="text-xs mono whitespace-nowrap" style="color:var(--muted);">${formatDateTime(a.ts)}</span>
@@ -1155,11 +1310,20 @@ function wireEvents(){
 
       switch(action){
         case "login-operateur": loginAsOperateur(); break;
-        case "login-superviseur": {
-          const pin = document.getElementById("pin-input").value.trim();
-          tryLoginSuperviseur(pin);
+        case "login-superviseur":
+          tryLoginSuperviseur(document.getElementById("sup-name").value, document.getElementById("sup-code").value);
           break;
-        }
+        case "login-admin":
+          tryLoginAdmin(document.getElementById("adm-email").value, document.getElementById("adm-code").value);
+          break;
+        case "login-mode": setState({ loginMode: el.getAttribute("data-mode"), loginError: "" }); break;
+        case "goto-supervisors":
+          navigate(STATE.view.screen==="supervisors" ? {screen:"home", lineId:null, posteId:null} : {screen:"supervisors", lineId:null, posteId:null});
+          break;
+        case "add-supervisor":
+          addSupervisor(document.getElementById("sv-name").value, document.getElementById("sv-code").value);
+          break;
+        case "delete-supervisor": deleteSupervisor(el.getAttribute("data-id")); break;
         case "choose-shift": chooseShift(shift); break;
         case "confirm-identity": {
           const name = document.getElementById("identify-name").value;
