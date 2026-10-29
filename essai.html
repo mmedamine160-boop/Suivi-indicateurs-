@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="robots" content="noindex"><meta name="theme-color" content="#14171A"><title>Suivi de production — Essai gratuit</title>
+<link rel="manifest" href="essai.webmanifest"><link rel="icon" type="image/png" href="favicon.png"><link rel="apple-touch-icon" href="apple-touch-icon.png">
+<style>html,body{margin:0;background:#14171A;min-height:100vh}</style></head>
+<body><script>
+function DecapusTrialHook(c){
+  var T=null;try{T=JSON.parse(localStorage.getItem(c.LST)||'null')}catch(e){}
+  if(!T||!T.id)return;
+  var DAY=864e5,locked=false,tm;
+  function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(x){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]})}
+  function left(){
+    if(!T.until)return '';
+    var ms=T.until-Date.now();if(ms<=0)return 'Essai terminé.';
+    var d=Math.ceil(ms/DAY);return d>1?d+' jours restants':'Dernier jour d\'essai';
+  }
+  function bar(){
+    if(!document.body)return;
+    var b=document.getElementById('trial-bar');
+    if(!b){b=document.createElement('div');b.id='trial-bar';
+      b.style.cssText='position:fixed;left:50%;transform:translateX(-50%);bottom:calc(10px + env(safe-area-inset-bottom,0px));z-index:9980;background:rgba(15,22,38,.94);color:#fff;border:1px solid #f6ad55;border-radius:999px;padding:6px 14px;font:600 12px system-ui,sans-serif;pointer-events:none;white-space:nowrap;max-width:94vw;overflow:hidden;text-overflow:ellipsis';
+      document.body.appendChild(b)}
+    b.textContent='Essai gratuit · '+left().replace(/\.$/,'')+(c.hint?' · '+c.hint:'');
+  }
+  function exportData(){
+    try{
+      var raw=localStorage.getItem(c.dataKey)||'{}';var txt=raw;
+      try{txt=JSON.stringify(JSON.parse(raw),null,2)}catch(e){}
+      var bl=new Blob([txt],{type:'application/json'});var x=document.createElement('a');
+      x.href=URL.createObjectURL(bl);x.download=c.exportName||'essai.json';document.body.appendChild(x);x.click();x.remove();
+    }catch(e){}
+  }
+  function lock(msg){
+    if(locked)return;locked=true;
+    try{clearInterval(tm)}catch(e){}
+    var o=document.createElement('div');
+    o.style.cssText='position:fixed;inset:0;z-index:99999;background:rgba(15,22,38,.97);color:#eef1f6;display:flex;align-items:center;justify-content:center;padding:24px;font-family:system-ui,sans-serif';
+    var cc=String(T.contact||'').trim(),ch;
+    if(!cc)ch=esc('Contactez DECAPUS SYSTEMS pour vous abonner et continuer.');
+    else if(!/^[+\d\s().-]{6,}$/.test(cc))ch=esc(cc);
+    else{var dg=cc.replace(/\D/g,'');if(dg.length===8)dg='216'+dg;ch='Contact WhatsApp : <a href="https://wa.me/'+dg+'" style="color:inherit">'+esc(cc)+'</a>'}
+    o.innerHTML='<div style="max-width:360px;text-align:center;display:flex;flex-direction:column;gap:12px"><h2 style="margin:0;font-size:1.3rem">Votre essai est terminé</h2><div style="color:#a3adc0">'+esc(msg||'Merci d\'avoir testé l\'application. Vos données restent enregistrées sur cet appareil.')+'</div><div style="color:#f6ad55;font-weight:700">'+ch+'</div><button id="tr-exp" style="font:inherit;font-weight:700;background:#f6ad55;color:#1a1205;border:0;border-radius:10px;padding:12px;min-height:46px">Exporter mes données (JSON)</button></div>';
+    document.body.appendChild(o);
+    document.getElementById('tr-exp').onclick=exportData;
+  }
+  function save(){try{localStorage.setItem(c.LST,JSON.stringify(T))}catch(e){}}
+  function check(){
+    if(locked)return;
+    if(T.until&&Date.now()>T.until){lock();return}
+    var d='';try{d=localStorage.getItem(c.DEV)||''}catch(e){}
+    fetch(c.api+'?a=check&id='+encodeURIComponent(T.id)+'&dev='+encodeURIComponent(d),{cache:'no-store'})
+      .then(function(r){return r.json()}).then(function(r){
+        if(r.contact)T.contact=r.contact;
+        if(r.status==='revoked'){T.until=Date.now()-1;save();lock('Cet accès d\'essai a été désactivé.');return}
+        if(r.status==='expired'){T.until=r.until||Date.now()-1;save();lock();return}
+        if(r.status==='active'){T.until=r.until;save();bar()}
+      }).catch(function(){});
+  }
+  tm=setInterval(function(){if(T.until&&Date.now()>T.until)lock();else{bar();check()}},60000);
+  document.addEventListener('visibilitychange',function(){if(!document.hidden)check()});
+  setInterval(function(){if(!locked){if(T.until&&Date.now()>T.until)lock();else bar()}},15000);
+  bar();check();
+}
+
+function DecapusTrialEntry(cfg){
+  var LST=cfg.LST,DEV=cfg.DEV,API=cfg.api;
+  var esc=function(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})};
+  var jget=function(k){try{return JSON.parse(localStorage.getItem(k)||'null')}catch(e){return null}};
+  var jset=function(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}};
+  var ov=document.createElement('div');ov.id='trial-screen';
+  ov.style.cssText='position:fixed;inset:0;z-index:99990;overflow:auto;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;background:'+cfg.bg+';color:'+cfg.fg+';font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif';
+  document.body.appendChild(ov);
+  function btn(id,label){return '<button id="'+id+'" style="font:inherit;font-weight:700;background:'+cfg.accent+';color:'+cfg.accentFg+';border:0;border-radius:10px;padding:12px 14px;min-height:46px;cursor:pointer">'+esc(label)+'</button>'}
+  function muted(t){return '<div style="color:'+cfg.muted+';font-size:.9rem;line-height:1.45">'+t+'</div>'}
+  function show(title,html,b){
+    ov.innerHTML='<div style="width:100%;max-width:380px;background:'+cfg.card+';border:1px solid '+cfg.line+';border-radius:16px;padding:22px 18px;display:flex;flex-direction:column;gap:12px;box-shadow:0 20px 50px rgba(0,0,0,.35)"><div style="text-align:center;font-size:.72rem;letter-spacing:.2em;color:'+cfg.accent+';font-weight:700">'+esc(cfg.name.toUpperCase())+' · ESSAI GRATUIT</div><h2 style="margin:0;font-size:1.15rem">'+esc(title)+'</h2>'+html+(b||'')+'</div>';
+  }
+  function dev(){var d=null;try{d=localStorage.getItem(DEV)}catch(e){}if(!d){d=Math.random().toString(36).slice(2,12);try{localStorage.setItem(DEV,d)}catch(e){}}return d}
+  var qs=new URLSearchParams(location.search),saved=jget(LST)||{},id=qs.get('t')||saved.id||'';
+  if(!id){show('Lien d\'essai manquant',muted('Ouvrez le lien d\'essai que DECAPUS SYSTEMS vous a envoyé.'));return}
+  function ct(c){
+    c=String(c||'').trim();if(!c)return '';
+    if(!/^[+\d\s().-]{6,}$/.test(c))return '<div style="font-weight:700;color:'+cfg.fg+'">'+esc(c)+'</div>';
+    var d=c.replace(/\D/g,'');if(d.length===8)d='216'+d;
+    return '<div style="font-weight:700;color:'+cfg.fg+'">Contact WhatsApp : <a href="https://wa.me/'+d+'" style="color:inherit">'+esc(c)+'</a></div>';
+  }
+  function ended(r){
+    var c=r.contact?ct(r.contact):muted('Contactez DECAPUS SYSTEMS pour vous abonner et continuer.');
+    show('Votre essai est terminé',muted('Merci d\'avoir testé l\'application. Vos données restent enregistrées sur cet appareil.')+c);
+  }
+  async function start(r){
+    var same=saved.id===id,have=false;
+    try{have=localStorage.getItem(cfg.dataKey)!==null}catch(e){}
+    if(!same||!have)cfg.seed(r);
+    jset(LST,{id:id,until:r.until,app:r.app,seed:r.seed,contact:r.contact||'',checked:r.now||Date.now()});
+    try{await cfg.load(r,ov)}
+    catch(e){show('Chargement impossible','<div style="background:#3a1f22;color:#ff9b8f;border-radius:10px;padding:10px 12px;font-size:.88rem">Impossible de charger l\'application. Vérifiez votre connexion internet puis réessayez.</div>',btn('rt','Réessayer'));var b=document.getElementById('rt');if(b)b.onclick=function(){location.reload()}}
+  }
+  fetch(API+'?a=check&id='+encodeURIComponent(id)+'&dev='+dev(),{cache:'no-store'}).then(function(x){return x.json()}).then(function(r){
+    if(r.status==='unknown'||(r.app&&r.app!==cfg.app)){try{localStorage.removeItem(LST)}catch(e){}show('Lien invalide',muted('Ce lien d\'essai n\'existe pas, a été supprimé ou ne correspond pas à cette application. Demandez-en un nouveau à DECAPUS SYSTEMS.'));return}
+    if(r.status==='revoked'){show('Accès désactivé',muted('Cet accès d\'essai a été désactivé.')+ct(r.contact));return}
+    if(r.status==='expired'){jset(LST,{id:id,until:r.until||0,app:r.app,expired:true,contact:r.contact||''});ended(r);return}
+    start(r);
+  }).catch(function(){
+    if(saved.id===id&&saved.until&&Date.now()<saved.until)start({until:saved.until,app:saved.app,seed:saved.seed,contact:saved.contact,now:Date.now()});
+    else{show('Connexion requise','<div style="background:#3a1f22;color:#ff9b8f;border-radius:10px;padding:10px 12px;font-size:.88rem">Impossible de vérifier votre essai : pas de connexion internet.</div>'+muted('Connectez-vous à internet puis rouvrez l\'application.'),btn('rt','Réessayer'));var b=document.getElementById('rt');if(b)b.onclick=function(){location.reload()}}
+  });
+}
+
+var API='https://decapus-polyvalence.vercel.app/api/trial';
+var KEY='decapus-suivi-trial-data';
+var T_EMAIL='essai@decapus.tn',T_CODE='1234',T_SALT='trialsaltdecapus00',T_HASH='f64328c835788e367d7167b7cbdfa7397ca5821340f5fd23493adb3a1e5d7ada';
+var HOOK={LST:'decapus-suivi-trial',DEV:'decapus-suivi-dev',api:API,dataKey:KEY,exportName:'suivi-essai.json',hint:'Admin : '+T_EMAIL+' · code '+T_CODE};
+// Remplace la connexion Firebase par un stockage local (rien n'est envoyé à la base réelle).
+var SHIM=[
+'const KEY="'+KEY+'";',
+'const serverTimestamp=()=>Date.now();',
+'const docRef={k:KEY};',
+'const onSnapshot=(ref,ok)=>{setTimeout(()=>{let j=null;try{j=localStorage.getItem(ref.k)}catch(e){}ok({exists:()=>j!==null,data:()=>({json:j})})},0);return()=>{}};',
+'const setDoc=(ref,d)=>{try{localStorage.setItem(ref.k,d.json);return Promise.resolve()}catch(e){return Promise.reject(new Error("Stockage de l\'appareil plein"))}};'
+].join('\n');
+DecapusTrialEntry({
+  app:'suivi',name:'Suivi de production',
+  bg:'#14171A',card:'#1E2227',line:'#333940',fg:'#ECE9E4',muted:'#8B9198',accent:'#3B82C4',accentFg:'#ffffff',
+  LST:HOOK.LST,DEV:HOOK.DEV,api:API,dataKey:KEY,
+  seed:function(r){
+    try{
+            if(r.seed==='demo')localStorage.removeItem(KEY);
+      else localStorage.setItem(KEY,JSON.stringify({lines:[],history:[],accessLog:[]}));
+    }catch(e){}
+  },
+  load:async function(r){
+    var h=await (await fetch('index.html',{cache:'no-store'})).text();
+    var a=h.indexOf('import { initializeApp }'),m='const docRef = doc(db, "app", "production-lines");',b=h.indexOf(m);
+    if(a<0||b<0)throw new Error('format');
+    h=h.slice(0,a)+SHIM+h.slice(b+m.length);
+    // Compte administrateur d'essai (le vrai e-mail et le vrai code admin ne servent jamais dans l'essai)
+    var re=/const ADMIN_EMAIL = "[^"]*";/,rs=/const ADMIN_SALT = "[^"]*";/,rh=/const ADMIN_CODE_HASH = "[^"]*";/;
+    if(!re.test(h)||!rs.test(h)||!rh.test(h))throw new Error('format');
+    h=h.replace(re,'const ADMIN_EMAIL = "'+T_EMAIL+'";').replace(rs,'const ADMIN_SALT = "'+T_SALT+'";').replace(rh,'const ADMIN_CODE_HASH = "'+T_HASH+'";')
+       .replace('href="manifest.webmanifest"','href="essai.webmanifest"')
+       .replace('<title>Suivi de production</title>','<title>Suivi de production — Essai</title>');
+    var i=h.lastIndexOf('</body>');
+    h=h.slice(0,i)+'<script>('+DecapusTrialHook.toString()+')('+JSON.stringify(HOOK)+')<\/script>'+h.slice(i);
+    document.open();document.write(h);document.close();
+  }
+});
+</script></body></html>
