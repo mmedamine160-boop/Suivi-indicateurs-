@@ -724,14 +724,14 @@ function header(){
     : `<span class="w-2 h-2 rounded-full" style="background:var(--ok); box-shadow:0 0 6px var(--ok);" title="Synchronisé en direct"></span>`;
 
   return `
-  <header class="border-b sticky top-0 z-10 px-5 py-4 flex items-center gap-3" style="border-color:var(--border); background:var(--base);">
+  <header class="border-b sm:sticky top-0 z-10 px-5 py-4 flex items-center gap-3 flex-wrap" style="border-color:var(--border); background:var(--base);">
     ${backBtn}
     <i data-lucide="factory" width="20" height="20" style="color:var(--accent);"></i>
     <div>
       <h1 class="text-lg font-semibold uppercase leading-none flex items-center gap-2">${esc(title)} ${syncDot}</h1>
       ${subtitle ? `<p class="text-xs mt-1" style="color:var(--muted);">${esc(subtitle)}</p>` : ""}
     </div>
-    <div class="ml-auto flex items-center gap-2">
+    <div class="ml-auto flex items-center gap-2 flex-wrap justify-end">
       ${topActions}
       ${indicatorsBtn}
       ${supervisorsBtn}
