@@ -126,6 +126,20 @@ const ADMIN_EMAIL = "mmedamine160@gmail.com";
 const ADMIN_SALT = "2f2b26a368e3aa847e170f8934be946e";
 const ADMIN_CODE_HASH = "4ad99c66dc94fa7348c47bbbda9e496437de889cbbb24d638a6b8907df6851f3";
 const LOGIN_LOCK_KEY = "suivi-production-login-lock";
+/* Session superviseur : conservée 12 h sur l'appareil pour survivre à l'actualisation de la page */
+const SUP_SESSION_KEY = "suivi-production-sup-session";
+const SUP_SESSION_MS = 12*3600*1000;
+function saveSupSession(s){ try { localStorage.setItem(SUP_SESSION_KEY, JSON.stringify({ ...s, exp: Date.now()+SUP_SESSION_MS })); } catch(e) {} }
+function clearSupSession(){ try { localStorage.removeItem(SUP_SESSION_KEY); } catch(e) {} }
+function loadSupSession(){
+  try {
+    const s = JSON.parse(localStorage.getItem(SUP_SESSION_KEY) || "null");
+    if (!s || !(s.exp > Date.now()) || !s.name || !s.proof) return null;
+    if (s.isAdmin && s.proof !== ADMIN_CODE_HASH) return null;
+    return s;
+  } catch(e) { return null; }
+}
+const SAVED_SUP = loadSupSession();
 async function hashCode(code, salt){
   const enc = new TextEncoder();
   const key = await crypto.subtle.importKey("raw", enc.encode(code), "PBKDF2", false, ["deriveBits"]);
@@ -140,7 +154,7 @@ let STATE = {
   history: [], // journal des passages OK/NOK
   accessLog: [], // journal des connexions superviseur (nom, e-mail, date)
   supervisors: [], // [{id, name, salt, hash, createdAt}] — géré par l'admin
-  supervisorId: null,
+  supervisorId: SAVED_SUP ? SAVED_SUP.id : null,
   loginMode: "sup", // "sup" | "admin"
   supError: "",
   svName: "", svCode: "", // brouillon du formulaire « nouveau superviseur » (conservé en cas d'erreur)
@@ -148,12 +162,12 @@ let STATE = {
   supOk: "",
   loading: true,
   connError: "",
-  role: localStorage.getItem(ROLE_KEY) === "operateur" ? "operateur" : null, // seul l'opérateur reste connecté ; le superviseur se reconnecte à chaque fois
+  role: SAVED_SUP ? "superviseur" : (localStorage.getItem(ROLE_KEY) === "operateur" ? "operateur" : null), // l'opérateur et le superviseur (12 h) restent connectés après actualisation
   shift: currentShift(), // automatique selon l'heure actuelle (voir SHIFT_HOURS)
-  identified: false, // le superviseur doit s'identifier (nom + e-mail) à chaque connexion
-  supervisorName: "",
-  supervisorEmail: "",
-  isAdmin: false,
+  identified: !!SAVED_SUP,
+  supervisorName: SAVED_SUP ? SAVED_SUP.name : "",
+  supervisorEmail: SAVED_SUP ? (SAVED_SUP.email || "") : "",
+  isAdmin: SAVED_SUP ? !!SAVED_SUP.isAdmin : false,
   loginError: "",
   identifyError: "",
   view: { screen: "home", lineId: null, posteId: null },
@@ -178,8 +192,8 @@ onSnapshot(docRef, (snap) => {
         STATE.supervisors = Array.isArray(raw.supervisors) ? raw.supervisors : [];
       }
       /* Si l'admin retire un superviseur, sa session est fermée */
-      if (STATE.role === "superviseur" && !STATE.isAdmin && !STATE.supervisors.some(x => x.id === STATE.supervisorId)) {
-        STATE.role = null; STATE.identified = false; STATE.supervisorName = ""; STATE.supervisorId = null;
+      if (STATE.role === "superviseur" && !STATE.isAdmin && !STATE.supervisors.some(x => x.id === STATE.supervisorId && x.hash === (SAVED_SUP && SAVED_SUP.id === x.id ? SAVED_SUP.proof : x.hash))) {
+        clearSupSession(); STATE.role = null; STATE.identified = false; STATE.supervisorName = ""; STATE.supervisorId = null;
         STATE.view = { screen:"home", lineId:null, posteId:null }; STATE.modal = null;
         STATE.loginError = "Votre accès superviseur a été retiré par l'administrateur.";
       }
@@ -231,7 +245,7 @@ function loginFailed(msg){
   if (loginFails >= 5) { loginFails = 0; try { localStorage.setItem(LOGIN_LOCK_KEY, String(Date.now() + 60000)); } catch(e) {} msg = "Trop d'essais. Réessayez dans 60 secondes."; }
   setState({ loginError: msg });
 }
-function openSupervisorSession({ name, email, isAdmin, id }){
+function openSupervisorSession({ name, email, isAdmin, id, proof }){
   STATE.identified = true;
   STATE.supervisorName = name;
   STATE.supervisorEmail = email || "";
@@ -243,6 +257,7 @@ function openSupervisorSession({ name, email, isAdmin, id }){
   STATE.accessLog = next.length > ACCESS_LOG_LIMIT ? next.slice(next.length - ACCESS_LOG_LIMIT) : next;
   STATE.role = "superviseur";
   STATE.view = { screen:"home", lineId:null, posteId:null };
+  saveSupSession({ id: id || null, name, email: email || "", isAdmin, proof });
   writeState();
 }
 async function tryLoginSuperviseur(name, code){
@@ -256,7 +271,7 @@ async function tryLoginSuperviseur(name, code){
   if (sup) { try { ok = (await hashCode(c, sup.salt)) === sup.hash; } catch(e) {} }
   if (!ok) { loginFailed("Nom ou code d'accès incorrect."); return; }
   loginFails = 0;
-  openSupervisorSession({ name: sup.name, isAdmin:false, id: sup.id });
+  openSupervisorSession({ name: sup.name, isAdmin:false, id: sup.id, proof: sup.hash });
 }
 async function tryLoginAdmin(email, code){
   const wait = loginLocked();
@@ -267,7 +282,7 @@ async function tryLoginAdmin(email, code){
   if (e && c && e === ADMIN_EMAIL.toLowerCase()) { try { ok = (await hashCode(c, ADMIN_SALT)) === ADMIN_CODE_HASH; } catch(err) {} }
   if (!ok) { loginFailed("E-mail ou code admin incorrect."); return; }
   loginFails = 0;
-  openSupervisorSession({ name:"Administrateur", email: ADMIN_EMAIL, isAdmin:true, id:"admin" });
+  openSupervisorSession({ name:"Administrateur", email: ADMIN_EMAIL, isAdmin:true, id:"admin", proof: ADMIN_CODE_HASH });
 }
 
 /* ---------- Gestion des superviseurs (admin uniquement) ---------- */
@@ -317,6 +332,7 @@ function confirmIdentity(name, email){
   writeState();
 }
 function logout(){
+  clearSupSession();
   localStorage.removeItem(ROLE_KEY);
   localStorage.removeItem(SHIFT_KEY);
   setState({ role: null, shift: null, identified:false, supervisorName:"", supervisorEmail:"", isAdmin:false, identifyError:"", loginName:"", loginEmail:"", loginError:"", loginMode:"sup", supError:"", supOk:"", svName:"", svCode:"", view: {screen:"home", lineId:null, posteId:null} });
