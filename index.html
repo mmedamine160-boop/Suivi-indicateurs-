@@ -72,10 +72,11 @@ function allIndicatorNames(){
   const order = [];
   const seen = new Set();
   DEFAULT_INDICATORS.forEach(n => { order.push(n); seen.add(n); });
-  STATE.lines.forEach(l => l.postes.forEach(p => SHIFTS.forEach(s =>
+  const _ul = uapLines();
+  _ul.forEach(l => l.postes.forEach(p => SHIFTS.forEach(s =>
     (p.shifts[s]||[]).forEach(i => { if (!seen.has(i.name)) { seen.add(i.name); order.push(i.name); } })
   )));
-  return order.filter(n => STATE.lines.some(l => l.postes.some(p => SHIFTS.some(s => (p.shifts[s]||[]).some(i => i.name === n)))));
+  return order.filter(n => _ul.some(l => l.postes.some(p => SHIFTS.some(s => (p.shifts[s]||[]).some(i => i.name === n)))));
 }
 
 function seedLines(){
@@ -86,7 +87,7 @@ function seedLines(){
     {id:"L4", name:"Ligne 4", subtitle:"Emballage", postes:3},
   ];
   return defs.map(line => ({
-    id: line.id, name: line.name, subtitle: line.subtitle,
+    id: line.id, uapId:"U1", name: line.name, subtitle: line.subtitle,
     postes: Array.from({length: line.postes}, (_, i) => {
       const posteId = `${line.id}-P${i+1}`;
       const shifts = {};
@@ -112,6 +113,46 @@ function normalizeLines(lines){
     })
   }));
 }
+
+/* ---------- UAP (unités autonomes de production) : niveau au-dessus des lignes ---------- */
+const UAP_KEY = "suivi-production-uap";
+function loadUapSel(){ try { return localStorage.getItem(UAP_KEY) || null; } catch(e) { return null; } }
+function setUapSel(id){ STATE.uapSel = id; try { if (id) localStorage.setItem(UAP_KEY, id); else localStorage.removeItem(UAP_KEY); } catch(e) {} }
+/* Garantit la cohérence des données : au moins une UAP, chaque ligne / superviseur / événement rattaché à une UAP existante.
+   Les anciennes données (sans UAP) sont rattachées à la première UAP (« UAP 1 »). */
+function ensureUaps(){
+  let us = Array.isArray(STATE.uaps) ? STATE.uaps.filter(u => u && u.id) : [];
+  if (!us.length) us = [{ id:"U1", name:"UAP 1" }];
+  const ids = new Set(us.map(u => u.id));
+  const first = us[0].id;
+  STATE.lines.forEach(l => {
+    if (!l.uapId) l.uapId = first;
+    if (!ids.has(l.uapId)) { us.push({ id:l.uapId, name:`UAP ${us.length+1}` }); ids.add(l.uapId); }
+  });
+  STATE.supervisors = STATE.supervisors.map(x => ids.has(x.uapId) ? x : { ...x, uapId:first });
+  STATE.history = STATE.history.map(h => {
+    if (h.uapId) return h;
+    const l = STATE.lines.find(x => x.id === h.lineId);
+    return { ...h, uapId: l ? l.uapId : first };
+  });
+  STATE.uaps = us;
+}
+/* UAP en cours : le superviseur est limité à la sienne ; l'opérateur et l'admin choisissent (automatique s'il n'y en a qu'une) */
+function curUapId(){
+  const us = STATE.uaps || [];
+  if (!us.length) return null;
+  if (STATE.role === "superviseur" && !STATE.isAdmin) {
+    const sv = STATE.supervisors.find(x => x.id === STATE.supervisorId);
+    return sv && us.some(u => u.id === sv.uapId) ? sv.uapId : us[0].id;
+  }
+  if (us.length === 1 && !STATE.isAdmin) return us[0].id;
+  return us.some(u => u.id === STATE.uapSel) ? STATE.uapSel : null;
+}
+function uapName(id){ const u = (STATE.uaps||[]).find(x => x.id === id); return u ? u.name : ""; }
+function curUapName(){ return uapName(curUapId()); }
+function canSwitchUap(){ return STATE.isAdmin || (STATE.role === "operateur" && (STATE.uaps||[]).length > 1); }
+function uapLines(){ const c = curUapId(); return STATE.lines.filter(l => l.uapId === c); }
+function uapHistory(){ const c = curUapId(); return STATE.history.filter(h => h.uapId === c); }
 
 /* ---------- Accès superviseur / opérateur ---------- */
 const ROLE_KEY = "suivi-production-role";
@@ -151,6 +192,9 @@ async function hashCode(code, salt){
 function canEdit(){ return STATE.role === "superviseur"; }
 let STATE = {
   lines: [],
+  uaps: [], // [{id, name}] — gérées par l'admin uniquement
+  uapSel: loadUapSel(),
+  svUap: "",
   history: [], // journal des passages OK/NOK
   accessLog: [], // journal des connexions superviseur (nom, e-mail, date)
   supervisors: [], // [{id, name, salt, hash, createdAt}] — géré par l'admin
@@ -182,15 +226,18 @@ onSnapshot(docRef, (snap) => {
       if (Array.isArray(raw)) {
         // Ancien format : le document ne contenait que le tableau des lignes
         STATE.lines = normalizeLines(raw);
+        STATE.uaps = [];
         STATE.history = [];
         STATE.accessLog = [];
         STATE.supervisors = [];
       } else {
         STATE.lines = normalizeLines(raw.lines || []);
+        STATE.uaps = Array.isArray(raw.uaps) ? raw.uaps : [];
         STATE.history = raw.history || [];
         STATE.accessLog = raw.accessLog || [];
         STATE.supervisors = Array.isArray(raw.supervisors) ? raw.supervisors : [];
       }
+      ensureUaps();
       /* Si l'admin retire un superviseur, sa session est fermée */
       if (STATE.role === "superviseur" && !STATE.isAdmin && !STATE.supervisors.some(x => x.id === STATE.supervisorId && x.hash === (SAVED_SUP && SAVED_SUP.id === x.id ? SAVED_SUP.proof : x.hash))) {
         clearSupSession(); STATE.role = null; STATE.identified = false; STATE.supervisorName = ""; STATE.supervisorId = null;
@@ -201,10 +248,11 @@ onSnapshot(docRef, (snap) => {
   } else {
     const seeded = seedLines();
     STATE.lines = seeded;
+    STATE.uaps = [{ id:"U1", name:"UAP 1" }];
     STATE.history = [];
     STATE.accessLog = [];
     STATE.supervisors = [];
-    setDoc(docRef, { json: JSON.stringify({ lines: seeded, history: [], accessLog: [], supervisors: [] }), updatedAt: serverTimestamp() }).catch(()=>{});
+    setDoc(docRef, { json: JSON.stringify({ lines: seeded, uaps: STATE.uaps, history: [], accessLog: [], supervisors: [] }), updatedAt: serverTimestamp() }).catch(()=>{});
   }
   STATE.loading = false;
   STATE.connError = "";
@@ -290,18 +338,19 @@ function writeSupervisors(list){
   STATE.supervisors = list;
   writeState(); // la liste est enregistrée dans le même document que les lignes
 }
-async function addSupervisor(name, code){
+async function addSupervisor(name, code, uapId){
   if (!STATE.isAdmin) return;
   const n = (name||"").trim(), c = (code||"").trim();
-  STATE.svName = n; STATE.svCode = c;
+  STATE.svName = n; STATE.svCode = c; STATE.svUap = uapId;
+  if (!(STATE.uaps||[]).some(u => u.id === uapId)) { setState({ supError:"Choisissez l'UAP du superviseur.", supOk:"" }); return; }
   if (n.length < 2) { setState({ supError:"Saisissez le nom du superviseur (2 caractères minimum).", supOk:"" }); return; }
   if (c.length < 4) { setState({ supError:"Le code d'accès doit faire 4 caractères minimum.", supOk:"" }); return; }
   if (STATE.supervisors.some(x => x.name.trim().toLowerCase() === n.toLowerCase())) { setState({ supError:"Un superviseur porte déjà ce nom.", supOk:"" }); return; }
   const salt = Array.from(crypto.getRandomValues(new Uint8Array(16))).map(b => b.toString(16).padStart(2,"0")).join("");
   const hash = await hashCode(c, salt);
   STATE.svName = ""; STATE.svCode = "";
-  STATE.supError = ""; STATE.supOk = `« ${n} » ajouté. Communiquez-lui son code d'accès.`;
-  writeSupervisors([...STATE.supervisors, { id:`S${Date.now()}${Math.random().toString(36).slice(2,6)}`, name:n, salt, hash, createdAt:new Date().toISOString() }]);
+  STATE.supError = ""; STATE.supOk = `« ${n} » ajouté à ${uapName(uapId)}. Communiquez-lui son code d'accès.`;
+  writeSupervisors([...STATE.supervisors, { id:`S${Date.now()}${Math.random().toString(36).slice(2,6)}`, name:n, uapId, salt, hash, createdAt:new Date().toISOString() }]);
 }
 function deleteSupervisor(id){
   if (!STATE.isAdmin) return;
@@ -310,6 +359,51 @@ function deleteSupervisor(id){
   if (!confirm(`Retirer l'accès du superviseur « ${sup.name} » ?`)) return;
   STATE.supError = ""; STATE.supOk = `« ${sup.name} » retiré.`;
   writeSupervisors(STATE.supervisors.filter(x => x.id !== id));
+}
+/* ---------- Gestion des UAP (admin uniquement) ---------- */
+function addUap(name){
+  if (!STATE.isAdmin) return;
+  const n = (name||"").trim();
+  if (!n) return;
+  if (STATE.uaps.some(u => u.name.trim().toLowerCase() === n.toLowerCase())) { alert("Une UAP porte déjà ce nom."); return; }
+  STATE.uaps = [...STATE.uaps, { id:`U${Date.now()}`, name:n }];
+  STATE.modal = null;
+  writeState();
+}
+function renameUap(id, name){
+  if (!STATE.isAdmin) return;
+  const n = (name||"").trim();
+  if (!n) return;
+  if (STATE.uaps.some(u => u.id !== id && u.name.trim().toLowerCase() === n.toLowerCase())) { alert("Une UAP porte déjà ce nom."); return; }
+  STATE.uaps = STATE.uaps.map(u => u.id === id ? { ...u, name:n } : u);
+  STATE.modal = null;
+  writeState();
+}
+function deleteUap(id){
+  if (!STATE.isAdmin) return;
+  const u = STATE.uaps.find(x => x.id === id);
+  if (!u) return;
+  if (STATE.uaps.length <= 1) { alert("Il doit rester au moins une UAP."); return; }
+  const nl = STATE.lines.filter(l => l.uapId === id).length;
+  const ns = STATE.supervisors.filter(x => x.uapId === id).length;
+  if (!confirm(`Supprimer l'UAP « ${u.name} » avec ses ${nl} ligne(s) et son historique, et retirer l'accès de ses ${ns} superviseur(s) ? Cette action est irréversible.`)) return;
+  STATE.lines = STATE.lines.filter(l => l.uapId !== id);
+  STATE.supervisors = STATE.supervisors.filter(x => x.uapId !== id);
+  STATE.history = STATE.history.filter(h => h.uapId !== id);
+  STATE.uaps = STATE.uaps.filter(x => x.id !== id);
+  if (STATE.uapSel === id) setUapSel(null);
+  writeState();
+}
+function selectUap(id){
+  if (!canSwitchUap()) return;
+  if (!STATE.uaps.some(u => u.id === id)) return;
+  setUapSel(id);
+  setState({ view: { screen:"home", lineId:null, posteId:null } });
+}
+function leaveUap(){
+  if (!canSwitchUap()) return;
+  setUapSel(null);
+  setState({ view: { screen:"home", lineId:null, posteId:null } });
 }
 function chooseShift(shift){
   localStorage.setItem(SHIFT_KEY, shift);
@@ -333,6 +427,7 @@ function confirmIdentity(name, email){
 }
 function logout(){
   clearSupSession();
+  setUapSel(null);
   localStorage.removeItem(ROLE_KEY);
   localStorage.removeItem(SHIFT_KEY);
   setState({ role: null, shift: null, identified:false, supervisorName:"", supervisorEmail:"", isAdmin:false, identifyError:"", loginName:"", loginEmail:"", loginError:"", loginMode:"sup", supError:"", supOk:"", svName:"", svCode:"", view: {screen:"home", lineId:null, posteId:null} });
@@ -341,7 +436,7 @@ function logout(){
 /* Écrit l'état courant (lignes + historique) dans Firestore ; tous les appareils connectés reçoivent la mise à jour automatiquement */
 function writeState(){
   render();
-  const payload = { lines: STATE.lines, history: STATE.history, accessLog: STATE.accessLog, supervisors: STATE.supervisors };
+  const payload = { lines: STATE.lines, uaps: STATE.uaps, history: STATE.history, accessLog: STATE.accessLog, supervisors: STATE.supervisors };
   setDoc(docRef, { json: JSON.stringify(payload), updatedAt: serverTimestamp() })
     .then(() => { if (STATE.connError) { STATE.connError = ""; render(); } })
     .catch((err) => { STATE.connError = (err && err.message) || "Échec de la synchronisation."; render(); });
@@ -420,7 +515,7 @@ function confirmNok(lineId, posteId, shift, indicatorId, comment){
   const now = new Date().toISOString();
   const next = updateIndicator(lineId, posteId, shift, indicatorId, { status:"NOK", comment: trimmed, openedAt: now });
   STATE.lines = next;
-  addHistoryEntry({ lineId, lineName:line.name, posteId, posteName:poste.name, shift, indicatorName:ind.name, action:"NOK", comment: trimmed });
+  addHistoryEntry({ uapId:line.uapId, lineId, lineName:line.name, posteId, posteName:poste.name, shift, indicatorName:ind.name, action:"NOK", comment: trimmed });
   STATE.modal = null;
   writeState();
 }
@@ -432,7 +527,7 @@ function resolveOk(lineId, posteId, shift, indicatorId){
   const durationMs = ind.openedAt ? (Date.now() - new Date(ind.openedAt).getTime()) : null;
   const next = updateIndicator(lineId, posteId, shift, indicatorId, { status:"OK", comment:null, openedAt:null });
   STATE.lines = next;
-  addHistoryEntry({ lineId, lineName:line.name, posteId, posteName:poste.name, shift, indicatorName:ind.name, action:"OK", durationMs });
+  addHistoryEntry({ uapId:line.uapId, lineId, lineName:line.name, posteId, posteName:poste.name, shift, indicatorName:ind.name, action:"OK", durationMs });
   writeState();
 }
 function renameLine(lineId, name, subtitle){
@@ -446,9 +541,9 @@ function renamePoste(lineId, posteId, name){
   closeModal();
 }
 function addLine(name, subtitle){
-  if (!canEdit()) return;
+  if (!canEdit() || !curUapId()) return;
   const id = `L${Date.now()}`;
-  persist([...STATE.lines, {id, name, subtitle, postes: []}]);
+  persist([...STATE.lines, {id, uapId: curUapId(), name, subtitle, postes: []}]);
   closeModal();
 }
 function deleteLine(lineId){
@@ -484,7 +579,7 @@ function addIndicatorType(name){
   const trimmed = (name||"").trim();
   if (!trimmed) return;
   if (allIndicatorNames().includes(trimmed)) return;
-  const next = STATE.lines.map(line => ({
+  const next = STATE.lines.map(line => line.uapId !== curUapId() ? line : ({
     ...line,
     postes: line.postes.map(p => {
       const shifts = {};
@@ -501,7 +596,7 @@ function renameIndicatorType(oldName, newName){
   if (!canEdit()) return;
   const trimmed = (newName||"").trim();
   if (!trimmed || trimmed === oldName) return;
-  const next = STATE.lines.map(line => ({
+  const next = STATE.lines.map(line => line.uapId !== curUapId() ? line : ({
     ...line,
     postes: line.postes.map(p => {
       const shifts = {};
@@ -515,7 +610,7 @@ function deleteIndicatorType(name){
   if (!canEdit()) return;
   if (allIndicatorNames().length <= 1) { alert("Il doit rester au moins un indicateur."); return; }
   if (!confirm(`Supprimer l'indicateur « ${name} » de tous les postes et tous les shifts ? Cette action est irréversible.`)) return;
-  const next = STATE.lines.map(line => ({
+  const next = STATE.lines.map(line => line.uapId !== curUapId() ? line : ({
     ...line,
     postes: line.postes.map(p => {
       const shifts = {};
@@ -670,12 +765,17 @@ function header(){
   if (v.screen === "line") { const l = findLine(v.lineId); title = l ? l.name : ""; subtitle = l ? l.subtitle : ""; }
   if (v.screen === "poste") { const l = findLine(v.lineId); const p = findPoste(v.lineId, v.posteId); title = p ? p.name : ""; subtitle = l ? `${l.name} · ${l.subtitle}` : ""; }
 
+  const _un = curUapName();
+  if (!subtitle && _un && ((STATE.uaps||[]).length > 1 || STATE.isAdmin) && v.screen !== "supervisors" && v.screen !== "access-log") subtitle = "UAP · " + _un;
+  if (v.screen === "home" && !curUapId()) subtitle = STATE.isAdmin ? "Vue d'ensemble de l'usine" : "Choisissez l'UAP";
+  const inChooser = v.screen === "home" && !curUapId();
+
   const backBtn = v.screen !== "home" ? `
     <button data-action="back" class="text-[var(--muted)] hover:text-white transition-colors p-1 -ml-1" aria-label="Retour">
       <i data-lucide="arrow-left" width="20" height="20"></i>
     </button>` : "";
 
-  const topActions = (v.screen === "home" || v.screen === "dashboard" || v.screen === "stats" || v.screen === "history") && STATE.role === "superviseur" ? `
+  const topActions = (v.screen === "home" || v.screen === "dashboard" || v.screen === "stats" || v.screen === "history") && STATE.role === "superviseur" && !inChooser ? `
       <button data-action="goto-dashboard" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110 ${v.screen==="dashboard" ? "" : "border"}"
         style="${v.screen==="dashboard" ? "background:var(--accent);color:#fff;" : "border-color:var(--border);color:var(--text);"}">
         <i data-lucide="layout-dashboard" width="16" height="16"></i> Tableau de bord
@@ -693,7 +793,15 @@ function header(){
         <i data-lucide="plus" width="16" height="16"></i> Nouvelle ligne
       </button>` : ""}` : "";
 
-  const indicatorsBtn = canEdit() ? `
+  const chooserActions = inChooser && STATE.isAdmin ? `
+      <button data-action="open-add-uap" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110" style="background:var(--accent);color:#fff;">
+        <i data-lucide="plus" width="16" height="16"></i> Nouvelle UAP
+      </button>` : "";
+  const uapSwitchBtn = canSwitchUap() && curUapId() ? `
+      <button data-action="goto-uaps" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110 border" style="border-color:var(--border);color:var(--text);" title="Changer d'UAP">
+        <i data-lucide="layers" width="16" height="16"></i> <span class="hidden sm:inline">${esc(_un)}</span>
+      </button>` : "";
+  const indicatorsBtn = canEdit() && !inChooser ? `
       <button data-action="open-manage-indicators" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110 border" style="border-color:var(--border);color:var(--text);" title="Gérer les indicateurs">
         <i data-lucide="list-checks" width="16" height="16"></i>
       </button>` : "";
@@ -713,7 +821,7 @@ function header(){
   const roleBadge = `
     <span class="text-xs px-2 py-1 rounded flex items-center gap-1" style="color:var(--muted); border:1px solid var(--border);" title="${esc(STATE.role==='superviseur' ? STATE.supervisorName+' · '+STATE.supervisorEmail : '')}">
       <i data-lucide="${STATE.role === "superviseur" ? (STATE.isAdmin ? "crown" : "shield") : "user"}" width="12" height="12"></i>
-      ${STATE.role === "superviseur" ? (STATE.isAdmin ? "Admin" : "Superviseur") : `Opérateur · ${esc(STATE.shift || "")}`}
+      ${STATE.role === "superviseur" ? (STATE.isAdmin ? "Admin" : "Superviseur" + ((STATE.uaps||[]).length > 1 ? " · " + esc(_un) : "")) : `Opérateur · ${esc(STATE.shift || "")}`}
     </span>
     <button data-action="logout" style="color:var(--muted);" class="hover:text-white transition-colors p-1" title="Changer de profil">
       <i data-lucide="log-out" width="16" height="16"></i>
@@ -732,6 +840,8 @@ function header(){
       ${subtitle ? `<p class="text-xs mt-1" style="color:var(--muted);">${esc(subtitle)}</p>` : ""}
     </div>
     <div class="ml-auto flex items-center gap-2 flex-wrap justify-end">
+      ${chooserActions}
+      ${uapSwitchBtn}
       ${topActions}
       ${indicatorsBtn}
       ${supervisorsBtn}
@@ -763,8 +873,53 @@ function body(){
   return "";
 }
 
+function uapsView(){
+  const us = STATE.uaps;
+  const totalNok = STATE.lines.reduce((a,l)=>a+nokCount(l),0);
+  const cards = us.map(u => {
+    const ls = STATE.lines.filter(l => l.uapId === u.id);
+    const problems = ls.reduce((a,l)=>a+nokCount(l),0);
+    const postes = ls.reduce((a,l)=>a+l.postes.length,0);
+    const alert = problems > 0;
+    return `
+    <div class="group relative text-left rounded-lg border overflow-hidden hover:brightness-110 transition-all cursor-pointer"
+         style="background:var(--surface); border-color:var(--border);" data-action="select-uap" data-uap="${esc(u.id)}">
+      <div class="absolute left-0 top-0 bottom-0 w-1" style="background:${alert ? "var(--nok)" : "var(--ok)"};"></div>
+      <div class="p-5 pl-6">
+        <div class="flex items-start justify-between">
+          <div>
+            <h2 class="text-xl font-semibold uppercase tracking-wide">${esc(u.name)}</h2>
+            <p class="text-sm mt-0.5" style="color:var(--muted);">${ls.length} ligne${ls.length>1?"s":""} · ${postes} poste${postes>1?"s":""}</p>
+          </div>
+          <div class="flex items-center gap-1 mt-1">
+            ${STATE.isAdmin ? `
+            <span data-action="delete-uap" data-uap="${esc(u.id)}" class="hover:text-white transition-colors p-1" style="color:var(--muted);" aria-label="Supprimer l'UAP">
+              <i data-lucide="trash-2" width="15" height="15"></i>
+            </span>
+            <span data-action="open-edit-uap" data-uap="${esc(u.id)}" class="hover:text-white transition-colors p-1" style="color:var(--muted);" aria-label="Renommer l'UAP">
+              <i data-lucide="pencil" width="15" height="15"></i>
+            </span>` : ""}
+            <i data-lucide="chevron-right" width="18" height="18" style="color:var(--muted);"></i>
+          </div>
+        </div>
+        <div class="flex items-center justify-end mt-5">
+          ${alert
+            ? `<span class="text-xs font-medium px-2 py-1 rounded flex items-center gap-1" style="color:var(--nok); background:rgba(229,72,77,0.12);"><i data-lucide="alert-triangle" width="12" height="12"></i> ${problems} anomalie${problems>1?"s":""}</span>`
+            : `<span class="text-xs font-medium px-2 py-1 rounded" style="color:var(--ok); background:rgba(74,222,128,0.12);">Conforme</span>`
+          }
+        </div>
+      </div>
+    </div>`;
+  }).join("");
+  const intro = STATE.isAdmin
+    ? `Vue d'ensemble de l'usine : ${us.length} UAP, ${totalNok} anomalie${totalNok>1?"s":""} en cours. Vous seul pouvez ajouter, renommer ou supprimer une UAP.`
+    : "Choisissez l'UAP sur laquelle vous travaillez.";
+  return `<main class="p-5"><p class="text-sm mb-4" style="color:var(--muted);">${esc(intro)}</p><div class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">${cards}</div></main>`;
+}
+
 function homeView(){
-  const cards = STATE.lines.map(line => {
+  if (!curUapId()) return uapsView();
+  const cards = uapLines().map(line => {
     const problems = nokCount(line);
     const alert = problems > 0;
     return `
@@ -909,7 +1064,7 @@ function posteView(){
 }
 
 function dashboardView(){
-  const lines = STATE.lines;
+  const lines = uapLines();
   const anomalies = getAllAnomalies(lines);
   const totalLines = lines.length;
   const totalPostes = lines.reduce((a,l)=>a+l.postes.length,0);
@@ -924,7 +1079,7 @@ function dashboardView(){
   };
   const today = new Date();
   const yesterday = new Date(); yesterday.setDate(today.getDate()-1);
-  const nokEvents = STATE.history.filter(h => h.action === "NOK");
+  const nokEvents = uapHistory().filter(h => h.action === "NOK");
   const todayCount = nokEvents.filter(h => sameDay(h.ts, today)).length;
   const yesterdayCount = nokEvents.filter(h => sameDay(h.ts, yesterday)).length;
   const diff = todayCount - yesterdayCount;
@@ -1023,7 +1178,7 @@ function barChart(title, entries, colorVar){
 }
 
 function statsView(){
-  const anomalies = getAllAnomalies(STATE.lines);
+  const anomalies = getAllAnomalies(uapLines());
   const total = anomalies.length;
 
   const count = (arr, keyFn) => {
@@ -1071,7 +1226,7 @@ function statsView(){
 
 /* ---------- Historique ---------- */
 function historyView(){
-  const entries = [...STATE.history].reverse(); // plus récent en premier
+  const entries = [...uapHistory()].reverse(); // plus récent en premier
   const rows = entries.length === 0
     ? `<div class="rounded-lg border p-6 flex flex-col items-center text-center gap-2" style="background:var(--surface); border-color:var(--border); color:var(--muted);">
         <i data-lucide="history" width="22" height="22"></i>
@@ -1108,9 +1263,9 @@ function historyView(){
 }
 
 function exportHistoryCsv(){
-  const header = ["Date","Ligne","Poste","Shift","Indicateur","Action","Motif / Durée"];
-  const lines = STATE.history.map(h => [
-    formatDateTime(h.ts), h.lineName, h.posteName, h.shift, h.indicatorName,
+  const header = ["Date","UAP","Ligne","Poste","Shift","Indicateur","Action","Motif / Durée"];
+  const lines = uapHistory().map(h => [
+    formatDateTime(h.ts), curUapName(), h.lineName, h.posteName, h.shift, h.indicatorName,
     h.action, h.action==="NOK" ? (h.comment||"") : formatDuration(h.durationMs)
   ]);
   const csvEscape = v => `"${String(v).replace(/"/g,'""')}"`;
@@ -1138,18 +1293,20 @@ function supervisorsView(){
           <i data-lucide="shield" width="14" height="14" style="color:var(--accent);"></i>
           <span>
             <span class="text-sm font-medium block">${esc(x.name)}</span>
-            <span class="text-xs" style="color:var(--muted);">Ajouté le ${formatDateTime(x.createdAt)}</span>
+            <span class="text-xs" style="color:var(--muted);">${esc(uapName(x.uapId))} · ajouté le ${formatDateTime(x.createdAt)}</span>
           </span>
         </span>
         <button data-action="delete-supervisor" data-id="${esc(x.id)}" class="text-xs border rounded px-2.5 py-1.5 hover:brightness-125" style="border-color:var(--nok); color:var(--nok);">Retirer</button>
       </div>`).join("");
   return `
   <main class="p-5 max-w-xl">
-    <p class="text-sm mb-4" style="color:var(--muted);">Les superviseurs ont les mêmes droits que vous, sauf la gestion des superviseurs. Ils se connectent avec leur nom et leur code d'accès.</p>
+    <p class="text-sm mb-4" style="color:var(--muted);">Chaque superviseur est rattaché à une UAP : il ne voit et ne gère que les lignes de son UAP. Il se connecte avec son nom et son code d'accès. Seul l'administrateur gère les UAP et les superviseurs.</p>
     <div class="rounded-lg border p-4 mb-5" style="background:var(--surface); border-color:var(--border);">
       <h2 class="text-sm font-semibold uppercase tracking-wide mb-3">Nouveau superviseur</h2>
       <input id="sv-name" placeholder="Nom du superviseur" value="${esc(STATE.svName)}" ${inp} />
       <input id="sv-code" placeholder="Code d'accès (4 caractères minimum)" value="${esc(STATE.svCode)}" ${inp} />
+      <label class="text-xs block mb-1" style="color:var(--muted);">UAP du superviseur</label>
+      <select id="sv-uap" ${inp}>${STATE.uaps.map(u => `<option value="${esc(u.id)}" ${u.id === (STATE.svUap || curUapId() || STATE.uaps[0].id) ? "selected" : ""}>${esc(u.name)}</option>`).join("")}</select>
       ${STATE.supError ? `<p class="text-xs mb-2" style="color:var(--nok);">${esc(STATE.supError)}</p>` : ""}
       ${STATE.supOk ? `<p class="text-xs mb-2" style="color:var(--ok);">${esc(STATE.supOk)}</p>` : ""}
       <button data-action="add-supervisor" class="w-full text-sm rounded px-3 py-2 hover:brightness-110" style="background:var(--accent); color:#fff;">Ajouter</button>
@@ -1208,6 +1365,11 @@ function exportAccessLogCsv(){
 function modalHtml(){
   const m = STATE.modal;
   if (!m) return "";
+  if (m.type === "add-uap" && STATE.isAdmin) return nameModal({ title:"Nouvelle UAP", action:"save-add-uap" });
+  if (m.type === "edit-uap" && STATE.isAdmin) {
+    const u = STATE.uaps.find(x => x.id === m.uapId); if (!u) return "";
+    return nameModal({ title:"Renommer l'UAP", name:u.name, action:"save-edit-uap", uapId:u.id });
+  }
   if (m.type === "add-line") return nameModal({ title:"Nouvelle ligne", showSubtitle:true, action:"save-add-line" });
   if (m.type === "edit-line") {
     const l = findLine(m.lineId); if (!l) return "";
@@ -1286,7 +1448,7 @@ function manageIndicatorsModal(){
   </div>`;
 }
 
-function nameModal({title, name="", subtitle="", showSubtitle=false, action, lineId="", posteId=""}){
+function nameModal({title, name="", subtitle="", showSubtitle=false, action, lineId="", posteId="", uapId=""}){
   return `
   <div class="fixed inset-0 z-50 flex items-center justify-center px-4" style="background:rgba(0,0,0,0.6);" data-action="close-modal">
     <div class="w-full max-w-sm rounded-lg border p-5" style="background:var(--surface); border-color:var(--border);" onclick="event.stopPropagation()">
@@ -1301,7 +1463,7 @@ function nameModal({title, name="", subtitle="", showSubtitle=false, action, lin
       <input id="modal-subtitle" value="${esc(subtitle)}" class="w-full rounded border px-3 py-2 text-sm mb-3 outline-none" style="background:var(--base); border-color:var(--border); color:var(--text);" />` : ""}
       <div class="flex justify-end gap-2 mt-3">
         <button data-action="close-modal" class="text-sm border rounded px-3 py-2 hover:brightness-110" style="color:var(--muted); border-color:var(--border);">Annuler</button>
-        <button data-action="${action}" data-line="${lineId}" data-poste="${posteId}" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110" style="background:var(--accent); color:#fff;">
+        <button data-action="${action}" data-line="${lineId}" data-poste="${posteId}" data-uap="${esc(uapId)}" class="text-sm rounded px-3 py-2 flex items-center gap-1.5 hover:brightness-110" style="background:var(--accent); color:#fff;">
           <i data-lucide="check" width="14" height="14"></i> Enregistrer
         </button>
       </div>
@@ -1321,6 +1483,7 @@ function wireEvents(){
       const shift = el.getAttribute("data-shift");
       const oldName = el.getAttribute("data-old-name");
       const idx = el.getAttribute("data-idx");
+      const uapId = el.getAttribute("data-uap");
 
       switch(action){
         case "login-operateur": loginAsOperateur(); break;
@@ -1335,7 +1498,7 @@ function wireEvents(){
           navigate(STATE.view.screen==="supervisors" ? {screen:"home", lineId:null, posteId:null} : {screen:"supervisors", lineId:null, posteId:null});
           break;
         case "add-supervisor":
-          addSupervisor(document.getElementById("sv-name").value, document.getElementById("sv-code").value);
+          addSupervisor(document.getElementById("sv-name").value, document.getElementById("sv-code").value, document.getElementById("sv-uap").value);
           break;
         case "delete-supervisor": deleteSupervisor(el.getAttribute("data-id")); break;
         case "choose-shift": chooseShift(shift); break;
@@ -1367,6 +1530,13 @@ function wireEvents(){
         case "goto-line": navigate({screen:"line", lineId, posteId:null}); break;
         case "goto-poste": navigate({screen:"poste", lineId, posteId}); break;
         case "retry-save": persist(STATE.lines); break;
+        case "select-uap": selectUap(uapId); break;
+        case "goto-uaps": leaveUap(); break;
+        case "open-add-uap": if (STATE.isAdmin) setState({ modal:{type:"add-uap"} }); break;
+        case "open-edit-uap": if (STATE.isAdmin) setState({ modal:{type:"edit-uap", uapId} }); break;
+        case "delete-uap": deleteUap(uapId); break;
+        case "save-add-uap": { const n = document.getElementById("modal-name").value.trim(); if (n) addUap(n); break; }
+        case "save-edit-uap": { const n = document.getElementById("modal-name").value.trim(); if (n) renameUap(uapId, n); break; }
         case "open-add-line": openModal({type:"add-line"}); break;
         case "open-edit-line": openModal({type:"edit-line", lineId}); break;
         case "delete-line": deleteLine(lineId); break;
